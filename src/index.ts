@@ -29,7 +29,23 @@ app.use((req: Request, res: Response, next: NextFunction) => {
     }
   }
 
-  res.header('Access-Control-Allow-Headers', process.env.CORS_HEADERS || 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  const requestHeaders = (req.headers['access-control-request-headers'] as string | undefined) || '';
+  const baseHeaders =
+    process.env.CORS_HEADERS ||
+    requestHeaders ||
+    'Origin, X-Requested-With, Content-Type, Accept, Authorization';
+  const ensureHeader = (headerList: string, headerName: string) => {
+    const parts = headerList
+      .split(',')
+      .map((h) => h.trim())
+      .filter(Boolean);
+    const has = parts.some((h) => h.toLowerCase() === headerName.toLowerCase());
+    return has ? headerList : `${headerList}, ${headerName}`;
+  };
+  // Garante compatibilidade com o preflight do browser (que manda "x-company-id" em minúsculo)
+  let allowHeaders = ensureHeader(baseHeaders, 'Authorization');
+  allowHeaders = ensureHeader(allowHeaders, 'X-Company-Id');
+  res.header('Access-Control-Allow-Headers', allowHeaders);
   res.header('Access-Control-Allow-Methods', process.env.CORS_METHODS || 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
 
   if (req.method === 'OPTIONS') {

@@ -1,39 +1,26 @@
-import { Column, Entity, PrimaryGeneratedColumn, CreateDateColumn, UpdateDateColumn, DeleteDateColumn, ManyToOne, JoinColumn } from 'typeorm';
-import { Companies } from './Companies';
+import { Column, Entity, OneToMany, PrimaryGeneratedColumn } from 'typeorm';
+import { CompanyUsers } from './CompanyUsers';
+
+export type UserType = 'admin' | 'user';
 
 @Entity('users')
 export class Users {
   @PrimaryGeneratedColumn('increment')
   id!: number;
 
-  @Column({ type: 'text', unique: true })
+  @Column({ type: 'varchar' })
+  name!: string;
+
+  // Mapeia para o enum já existente no Postgres: public.users_type_enum
+  @Column({ type: 'enum', enum: ['admin', 'user'], enumName: 'users_type_enum' })
+  type!: UserType;
+
+  @Column({ type: 'varchar', unique: true })
   email!: string;
 
-  @Column({ type: 'text' })
+  @Column({ type: 'varchar' })
   password!: string;
 
-  @Column({ type: 'text', nullable: true })
-  phone?: string;
-
-  @Column({ type: 'text', nullable: true })
-  name?: string;
-
-  @Column({ type: 'jsonb', default: () => "'[]'::jsonb" })
-  roles!: string[];
-
-  @Column({ type: 'int', nullable: true })
-  company_id?: number;
-
-  @ManyToOne(() => Companies, (company: Companies) => company.users, { nullable: true })
-  @JoinColumn({ name: 'company_id' })
-  company?: Companies;
-
-  @CreateDateColumn({ type: 'timestamp' })
-  created_at!: Date;
-
-  @UpdateDateColumn({ type: 'timestamp', nullable: true })
-  updated_at?: Date;
-
-  @DeleteDateColumn({ type: 'timestamp', nullable: true })
-  deleted_at?: Date;
+  @OneToMany(() => CompanyUsers, (cu: CompanyUsers) => cu.user)
+  company_users?: CompanyUsers[];
 }

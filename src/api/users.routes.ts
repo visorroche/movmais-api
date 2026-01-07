@@ -1,39 +1,38 @@
 import { Router, Request, Response } from 'express';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
- import type { EntityManager } from 'typeorm';
+import type { EntityManager } from 'typeorm';
 import { AppDataSource } from '../data-source';
 import { Users } from '../entities/Users';
 import { Companies } from '../entities/Companies';
+import { CompanyUsers } from '../entities/CompanyUsers';
 import { authMiddleware } from '../middleware/auth';
 
 export const usersRouter = Router();
 
 const JWT_SECRET = process.env.JWT_SECRET || 'changeme';
 
-function normalizeRoles(roles: unknown): string[] {
-  if (!roles) return [];
-  if (Array.isArray(roles)) return roles.filter((r): r is string => typeof r === 'string');
-  if (typeof roles === 'string') return [roles];
-  if (typeof roles === 'object' && roles !== null) {
-    const inner = (roles as any).roles;
-    if (Array.isArray(inner)) return inner.filter((r: any): r is string => typeof r === 'string');
-    if (typeof inner === 'string') return [inner];
-  }
+function rolesFromType(type: unknown): string[] {
+  if (type === 'admin') return ['admin'];
+  if (type === 'user') return ['user'];
   return [];
 }
 
 usersRouter.post('/register', async (req: Request, res: Response) => {
-  const { email, password, name, phone, company_name } = req.body as {
+  const { email, password, name, company_name, site, company_site } = req.body as {
     email?: string;
     password?: string;
     name?: string;
-    phone?: string;
     company_name?: string;
+    site?: string;
+    company_site?: string;
   };
 
   if (!email || !password) return res.status(400).json({ message: 'Email and password required' });
+  if (!name || !String(name).trim()) return res.status(400).json({ message: 'Name required' });
   if (!company_name || !String(company_name).trim()) return res.status(400).json({ message: 'Company name required' });
+  const siteValue = String(site ?? company_site ?? '').trim();
+  if (!siteValue) return res.status(400).json({ message: 'Company site required' });
 
   const normalizedEmail = String(email).trim().toLowerCase();
   if (String(password).length < 8) return res.status(400).json({ message: 'Password must be at least 8 characters' });
@@ -45,26 +44,24 @@ usersRouter.post('/register', async (req: Request, res: Response) => {
     const result = await AppDataSource.transaction(async (manager: EntityManager) => {
       const usersTx = manager.getRepository(Users);
       const companiesTx = manager.getRepository(Companies);
+      const companyUsersTx = manager.getRepository(CompanyUsers);
 
       const existing = await usersTx.findOne({ where: { email: normalizedEmail } as any });
       if (existing) return { conflict: true as const };
 
-      const company = companiesTx.create({ name: companyName });
+      const company = companiesTx.create({ name: companyName, site: siteValue });
       await companiesTx.save(company);
 
       const user = usersTx.create({
         email: normalizedEmail,
         password: hash,
-        name,
-        phone,
-        roles: [],
-        company_id: company.id,
-        company,
+        name: String(name).trim(),
+        type: 'admin',
       });
       await usersTx.save(user);
 
-      company.owner_id = user.id;
-      await companiesTx.save(company);
+      const companyUser = companyUsersTx.create({ company_id: company.id, user_id: user.id, owner: true });
+      await companyUsersTx.save(companyUser);
 
       return { conflict: false as const, user, company };
     });
@@ -78,8 +75,8 @@ usersRouter.post('/register', async (req: Request, res: Response) => {
       id: user.id,
       email: user.email,
       name: user.name,
-      phone: user.phone,
-      company_id: user.company_id,
+      type: user.type,
+      company_id: company.id,
       company: { id: company.id, name: company.name },
     });
   } catch (err: any) {
@@ -103,7 +100,7 @@ usersRouter.post('/login', async (req: Request, res: Response) => {
   const ok = await bcrypt.compare(String(password), user.password);
   if (!ok) return res.status(401).json({ message: 'Invalid credentials' });
 
-  const roles = normalizeRoles(user.roles);
+  const roles = rolesFromType(user.type);
   const token = jwt.sign({ userId: user.id, email: user.email, roles }, JWT_SECRET, { expiresIn: '1d' });
 
   return res.json({
@@ -112,9 +109,8 @@ usersRouter.post('/login', async (req: Request, res: Response) => {
       id: user.id,
       email: user.email,
       name: user.name,
-      phone: user.phone,
+      type: user.type,
       roles,
-      company_id: user.company_id,
     },
   });
 });
@@ -135,18 +131,43 @@ usersRouter.get('/me', async (req: Request, res: Response) => {
     return res.status(401).json({ message: 'Token inválido. Não autenticado.' });
   }
 
+  const headerCompanyIdRaw = (req.headers['x-company-id'] ?? req.headers['X-Company-Id']) as any;
+  const headerCompanyId = headerCompanyIdRaw ? Number(Array.isArray(headerCompanyIdRaw) ? headerCompanyIdRaw[0] : headerCompanyIdRaw) : null;
+  const headerCompanyIdValid = Number.isInteger(headerCompanyId) && (headerCompanyId as number) > 0 ? (headerCompanyId as number) : null;
+
   const repo = AppDataSource.getRepository(Users);
-  const user = await repo.findOne({ where: { id } as any, relations: { company: true } });
+  const user = await repo.findOne({ where: { id } as any });
   if (!user) return res.status(404).json({ message: 'User not found' });
 
-  const roles = normalizeRoles(user.roles);
+  let cu = null as any;
+  if (user.type === 'admin' && headerCompanyIdValid) {
+    const company = await AppDataSource.getRepository(Companies).findOne({ where: { id: headerCompanyIdValid } as any });
+    cu = company ? { company_id: company.id, company } : null;
+  } else {
+    if (headerCompanyIdValid) {
+      cu = await AppDataSource.getRepository(CompanyUsers).findOne({
+        where: { user_id: user.id, company_id: headerCompanyIdValid } as any,
+        relations: { company: true },
+      });
+    }
+    if (!cu) {
+      cu = await AppDataSource.getRepository(CompanyUsers).findOne({
+        where: { user_id: user.id } as any,
+        relations: { company: true },
+      });
+    }
+  }
+  const roles = rolesFromType(user.type);
+  const company = cu?.company ?? null;
+  const company_id = cu?.company_id ?? company?.id ?? null;
+
   return res.json({
     id: user.id,
     email: user.email,
     name: user.name,
-    phone: user.phone,
+    type: user.type,
     roles,
-    company_id: user.company_id,
-    company: user.company ? { id: user.company.id, name: user.company.name } : null,
+    company_id,
+    company: company ? { id: company.id, name: company.name, site: company.site, group_id: company.group_id ?? null } : null,
   });
 });

@@ -1,53 +1,33 @@
-import { Column, CreateDateColumn, DeleteDateColumn, Entity, OneToMany, PrimaryGeneratedColumn, UpdateDateColumn } from 'typeorm';
-import { Users } from './Users';
+import { Column, Entity, JoinColumn, ManyToOne, OneToMany, PrimaryGeneratedColumn } from 'typeorm';
+import { Groups } from './Groups';
+import { CompanyUsers } from './CompanyUsers';
+import { CompanyPlatforms } from './CompanyPlatforms';
+import { Customers } from './Customers';
 
 @Entity('companies')
 export class Companies {
   @PrimaryGeneratedColumn('increment')
   id!: number;
 
-  @Column({ type: 'text' })
+  @Column({ type: 'int', nullable: true })
+  group_id?: number | null;
+
+  @ManyToOne(() => Groups, (group: Groups) => group.companies, { nullable: true })
+  @JoinColumn({ name: 'group_id' })
+  group?: Groups | null;
+
+  @Column({ type: 'varchar' })
   name!: string;
 
-  @Column({ type: 'text', nullable: true })
-  document?: string;
+  @Column({ type: 'varchar' })
+  site!: string;
 
-  @Column({ type: 'text', nullable: true })
-  commercial_email?: string;
+  @OneToMany(() => CompanyPlatforms, (cp: CompanyPlatforms) => cp.company)
+  company_platforms?: CompanyPlatforms[];
 
-  @Column({ type: 'text', nullable: true })
-  commercial_phone?: string;
+  @OneToMany(() => CompanyUsers, (cu: CompanyUsers) => cu.company)
+  company_users?: CompanyUsers[];
 
-  @Column({ type: 'text', nullable: true })
-  site?: string;
-
-  @Column({ type: 'text', nullable: true })
-  logo?: string;
-
-  @Column({ type: 'text', nullable: true })
-  highlight_color?: string;
-
-  @Column({ type: 'text', nullable: true })
-  presentation_text?: string;
-
-  @Column({ type: 'timestamp', nullable: true })
-  assigned_at?: Date;
-
-  @Column({ type: 'timestamp', nullable: true })
-  canceled_at?: Date;
-
-  @Column({ type: 'int', nullable: true })
-  owner_id?: number;
-
-  @OneToMany(() => Users, (user: Users) => user.company)
-  users!: Users[];
-
-  @CreateDateColumn({ type: 'timestamp' })
-  created_at!: Date;
-
-  @UpdateDateColumn({ type: 'timestamp', nullable: true })
-  updated_at?: Date;
-
-  @DeleteDateColumn({ type: 'timestamp', nullable: true })
-  deleted_at?: Date;
+  @OneToMany(() => Customers, (c: Customers) => c.company)
+  customers?: Customers[];
 }

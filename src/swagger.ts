@@ -24,18 +24,17 @@ const options: swaggerJsdoc.Options = {
             id: { type: 'number' },
             email: { type: 'string' },
             password: { type: 'string' },
-            phone: { type: 'string', nullable: true },
-            name: { type: 'string', nullable: true },
-            roles: { type: 'array', items: { type: 'string' } },
-            company_id: { type: 'number', nullable: true },
+            name: { type: 'string' },
+            type: { type: 'string', enum: ['admin', 'user'] },
           },
         },
         Companies: {
           type: 'object',
           properties: {
             id: { type: 'number' },
+            group_id: { type: 'number', nullable: true },
             name: { type: 'string' },
-            document: { type: 'string', nullable: true },
+            site: { type: 'string' },
           },
         },
         Error: {

@@ -22,6 +22,7 @@ Variáveis principais:
 - `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASS`, `DB_NAME`
 - `JWT_SECRET`
 - `CORS_ORIGINS` (default: `http://localhost:5173`)
+- `CORS_HEADERS` (default inclui `Authorization` e `X-Company-Id`)
 
 ## 3) Subir o banco Postgres
 Você precisa de um banco Postgres rodando e com o database configurado (ex: `movmais`).
@@ -45,7 +46,7 @@ Servidor em:
 ## 6) Rotas principais
 - `GET /health`
 - `POST /users/register`
-  - body: `{ email, password, name?, phone?, company_name }`
+  - body: `{ email, password, name, company_name, site }` (ou `company_site` como alias de `site`)
 - `POST /users/login`
   - body: `{ email, password }`
 - `GET /users/me`
