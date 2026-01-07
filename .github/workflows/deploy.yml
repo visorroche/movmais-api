@@ -20,12 +20,7 @@ jobs:
           SERVER_USER: ${{ secrets.SERVER_USER }}
           SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
         run: |
-          mkdir -p ~/.ssh
-          echo "Host *" > ~/.ssh/config
-          echo "  StrictHostKeyChecking no" >> ~/.ssh/config
-          chmod 600 ~/.ssh/config
-          
-          apt-get update -qq && apt-get install -y sshpass > /dev/null 2>&1
+          sudo apt-get update -qq && sudo apt-get install -y sshpass > /dev/null 2>&1
           
           sshpass -p "$SERVER_PASSWORD" ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_HOST << 'DEPLOY'
           cd /opt/movmais/apps/movmais-api
