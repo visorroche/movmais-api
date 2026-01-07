@@ -21,13 +21,78 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.DEPLOY_KEY }}
           script: |
-            cd /opt/movmais/apps/api
+            echo "=========================================="
+            echo "🚀 INICIANDO DEPLOY DE back.movmais.com"
+            echo "=========================================="
+            
+            echo ""
+            echo "📍 PASSO 1: Verificar diretório"
+            ls -la /opt/movmais/apps/api
+            
+            echo ""
+            echo "📍 PASSO 2: Entrar no diretório"
+            cd /opt/movmais/apps/api || exit 1
+            pwd
+            
+            echo ""
+            echo "📍 PASSO 3: Verificar status do git ANTES"
+            git status
+            git log --oneline -5
+            
+            echo ""
+            echo "📍 PASSO 4: Fazer fetch do repositório"
             git fetch origin
+            
+            echo ""
+            echo "📍 PASSO 5: Reset hard para a versão remota"
             git reset --hard origin/main || git reset --hard origin/master
+            
+            echo ""
+            echo "📍 PASSO 6: Verificar status do git DEPOIS"
+            git status
+            git log --oneline -5
+            
+            echo ""
+            echo "📍 PASSO 7: Listar arquivos atualizados"
+            ls -la
+            
+            echo ""
+            echo "📍 PASSO 8: Voltar para diretório do docker-compose"
             cd /opt/movmais
+            pwd
+            
+            echo ""
+            echo "📍 PASSO 9: Verificar docker-compose"
+            ls -la docker-compose-apps.yml
+            
+            echo ""
+            echo "📍 PASSO 10: Parar container antigo"
+            docker-compose -f docker-compose-apps.yml stop movmais-api || true
+            
+            echo ""
+            echo "📍 PASSO 11: Remover container antigo"
+            docker-compose -f docker-compose-apps.yml rm -f movmais-api || true
+            
+            echo ""
+            echo "📍 PASSO 12: Fazer build da imagem"
             docker-compose -f docker-compose-apps.yml build --no-cache movmais-api
+            
+            echo ""
+            echo "📍 PASSO 13: Iniciar novo container"
             docker-compose -f docker-compose-apps.yml up -d movmais-api
-            echo "✅ Deploy de back.movmais.com concluído!"
+            
+            echo ""
+            echo "📍 PASSO 14: Verificar se container está rodando"
+            docker ps | grep movmais-api
+            
+            echo ""
+            echo "📍 PASSO 15: Verificar logs do container"
+            docker logs movmais-api | tail -20
+            
+            echo ""
+            echo "=========================================="
+            echo "✅ DEPLOY DE back.movmais.com CONCLUÍDO!"
+            echo "=========================================="
       
       - name: Notify success
         if: success()
