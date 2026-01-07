@@ -15,21 +15,29 @@ jobs:
         uses: actions/checkout@v4
       
       - name: Deploy to server
-        uses: appleboy/ssh-action@master
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          password: ${{ secrets.SERVER_PASSWORD }}
-          script: |
-            cd /opt/movmais/apps/movmais-api
-            git fetch origin
-            git reset --hard origin/main || git reset --hard origin/master
-            cd /opt/movmais
-            docker-compose -f docker-compose-apps.yml build --no-cache movmais-api
-            docker-compose -f docker-compose-apps.yml up -d movmais-api
-            echo "✅ Deploy de back.movmais.com concluído!"
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "Host *" > ~/.ssh/config
+          echo "  StrictHostKeyChecking no" >> ~/.ssh/config
+          chmod 600 ~/.ssh/config
+          
+          apt-get update -qq && apt-get install -y sshpass > /dev/null 2>&1
+          
+          sshpass -p "$SERVER_PASSWORD" ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_HOST << 'DEPLOY'
+          cd /opt/movmais/apps/movmais-api
+          git fetch origin
+          git reset --hard origin/main || git reset --hard origin/master
+          cd /opt/movmais
+          docker-compose -f docker-compose-apps.yml build --no-cache movmais-api
+          docker-compose -f docker-compose-apps.yml up -d movmais-api
+          echo "✅ Deploy de back.movmais.com concluído!"
+          DEPLOY
       
-      - name: Notify deployment
+      - name: Notify success
         if: success()
         run: echo "🚀 Deploy de back.movmais.com realizado com sucesso!"
       
