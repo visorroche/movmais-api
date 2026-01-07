@@ -97,6 +97,9 @@ usersRouter.post('/login', async (req: Request, res: Response) => {
   const user = await repo.findOne({ where: { email: normalizedEmail } as any });
   if (!user) return res.status(401).json({ message: 'Invalid credentials' });
 
+  // Se o usuário antigo não tem password (schema antigo), não dá pra autenticar.
+  if (!user.password) return res.status(401).json({ message: 'Invalid credentials' });
+
   const ok = await bcrypt.compare(String(password), user.password);
   if (!ok) return res.status(401).json({ message: 'Invalid credentials' });
 
