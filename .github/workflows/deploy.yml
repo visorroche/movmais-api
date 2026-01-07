@@ -6,7 +6,7 @@ on:
       - main
       - master
 
-jobs:  
+jobs:
   deploy:
     runs-on: ubuntu-latest
     
@@ -21,14 +21,18 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           password: ${{ secrets.SERVER_PASSWORD }}
           script: |
-            cd /opt/movmais/apps/api
+            cd /opt/movmais/apps/movmais-api
             git fetch origin
-            git reset --hard origin/main || git reset -hard origin/master
+            git reset --hard origin/main || git reset --hard origin/master
             cd /opt/movmais
-            docker-compose -f docker-compose-apps.yml build -no-cache movmais-api
+            docker-compose -f docker-compose-apps.yml build --no-cache movmais-api
             docker-compose -f docker-compose-apps.yml up -d movmais-api
-            echo "✅ Deploy conclu�do!"
-  
+            echo "✅ Deploy de back.movmais.com concluído!"
+      
       - name: Notify deployment
         if: success()
-        run: echo "🎯 Deploy de back.movmais.com concltído!
+        run: echo "🚀 Deploy de back.movmais.com realizado com sucesso!"
+      
+      - name: Notify failure
+        if: failure()
+        run: echo "❌ Falha no deploy de back.movmais.com"
