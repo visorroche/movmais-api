@@ -21,7 +21,7 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.DEPLOY_KEY }}
           script: |
-            cd /opt/movmais/apps/movmais-api
+            cd /opt/movmais/apps/api
             git fetch origin
             git reset --hard origin/main || git reset --hard origin/master
             cd /opt/movmais
