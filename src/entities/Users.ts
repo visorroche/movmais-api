@@ -8,18 +8,23 @@ export class Users {
   @PrimaryGeneratedColumn('increment')
   id!: number;
 
-  @Column({ type: 'varchar' })
+  @Column({ type: 'varchar', default: '' })
   name!: string;
 
   // Mapeia para o enum já existente no Postgres: public.users_type_enum
-  @Column({ type: 'enum', enum: ['admin', 'user'], enumName: 'users_type_enum' })
+  @Column({
+    type: 'enum',
+    enum: ['admin', 'user'],
+    enumName: 'users_type_enum',
+    default: 'user',
+  })
   type!: UserType;
 
-  @Column({ type: 'varchar', unique: true })
-  email!: string;
+  @Column({ type: 'varchar', unique: true, nullable: true })
+  email?: string | null;
 
-  @Column({ type: 'varchar' })
-  password!: string;
+  @Column({ type: 'varchar', nullable: true })
+  password?: string | null;
 
   @OneToMany(() => CompanyUsers, (cu: CompanyUsers) => cu.user)
   company_users?: CompanyUsers[];

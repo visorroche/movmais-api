@@ -16,10 +16,10 @@ export class Companies {
   @JoinColumn({ name: 'group_id' })
   group?: Groups | null;
 
-  @Column({ type: 'varchar' })
+  @Column({ type: 'varchar', default: 'Sem nome' })
   name!: string;
 
-  @Column({ type: 'varchar' })
+  @Column({ type: 'varchar', default: '' })
   site!: string;
 
   @OneToMany(() => CompanyPlatforms, (cp: CompanyPlatforms) => cp.company)
