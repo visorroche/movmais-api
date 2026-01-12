@@ -56,7 +56,7 @@ usersRouter.post('/register', async (req: Request, res: Response) => {
         email: normalizedEmail,
         password: hash,
         name: String(name).trim(),
-        type: 'admin',
+        type: 'user',
       });
       await usersTx.save(user);
 
