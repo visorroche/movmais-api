@@ -66,8 +66,6 @@ jobs:
             echo "📝 CRIAR ARQUIVO .ENV COM SECRETS"
             echo "=========================================="
             
-            # Criar arquivo .env com secrets usando echo
-            > /opt/movmais/apps/api/.env
             # Criar arquivo .env com secrets usando sed
             cat > /tmp/env_template.txt << 'EOF'
 DB_HOST=__DB_HOST__
