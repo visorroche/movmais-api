@@ -14,8 +14,9 @@ export class Products {
   @JoinColumn({ name: 'company_id' })
   company!: Companies;
 
-  @Column({ type: 'int' })
-  sku!: number;
+  // SKU pode vir com valores grandes (ex.: integrações) — manter como string para evitar overflow de int32 no Postgres.
+  @Column({ type: 'varchar' })
+  sku!: string;
 
   @Column({ type: 'int', nullable: true })
   ecommerce_id?: number | null;

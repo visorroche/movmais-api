@@ -943,3 +943,130 @@ companiesRouter.put('/me', async (req: Request, res: Response) => {
   const saved = await repo.save(existing);
   return res.json(saved);
 });
+
+function normalizeConfirmName(value: unknown): string {
+  return String(value ?? '').trim();
+}
+
+async function ensureOwnerOrAdmin(req: Request, companyId: number): Promise<{ ok: true; userId: number } | { ok: false; status: number; message: string }> {
+  const userId = await getAuthUserId(req);
+  if (!userId) return { ok: false, status: 401, message: 'Não autenticado' };
+
+  const user = await AppDataSource.getRepository(Users).findOne({ where: { id: userId } as any });
+  if (!user) return { ok: false, status: 401, message: 'Não autenticado' };
+  if (user.type === 'admin') return { ok: true, userId };
+
+  const link = await AppDataSource.getRepository(CompanyUsers).findOne({ where: { user_id: userId, company_id: companyId } as any });
+  if (!link) return { ok: false, status: 403, message: 'Sem acesso à empresa' };
+  if (!(link as any).owner) return { ok: false, status: 403, message: 'Apenas o owner pode executar esta ação' };
+  return { ok: true, userId };
+}
+
+companiesRouter.post('/me/danger/clear-data', async (req: Request, res: Response) => {
+  const companyId = await getAuthCompanyId(req);
+  if (!companyId) return res.status(400).json({ message: 'Company not configured for this user' });
+
+  const perm = await ensureOwnerOrAdmin(req, companyId);
+  if (!perm.ok) return res.status(perm.status).json({ message: perm.message });
+
+  const companyRepo = AppDataSource.getRepository(Companies);
+  const company = await companyRepo.findOne({ where: { id: companyId } as any });
+  if (!company) return res.status(404).json({ message: 'Company not found' });
+
+  const confirmName = normalizeConfirmName((req.body as any)?.confirm_name);
+  const expectedName = normalizeConfirmName(company.name);
+  if (!expectedName || confirmName !== expectedName) {
+    return res.status(400).json({
+      message: `Confirmação inválida. Digite exatamente o nome da empresa: "${expectedName}".`,
+    });
+  }
+
+  try {
+    const result = await AppDataSource.transaction(async (manager) => {
+      // Ordem importante por FKs:
+      // 1) order_items -> orders
+      // 2) products (referenciados por order_items)
+      // 3) customers (referenciados por orders)
+      const orderItemsRes = await manager.getRepository(OrderItems).delete({ company_id: companyId } as any);
+      const ordersRes = await manager.getRepository(Orders).delete({ company_id: companyId } as any);
+      const productsRes = await manager.getRepository(Products).delete({ company_id: companyId } as any);
+      const customersRes = await manager.getRepository(Customers).delete({ company_id: companyId } as any);
+
+      return {
+        deleted: {
+          order_items: orderItemsRes.affected ?? 0,
+          orders: ordersRes.affected ?? 0,
+          products: productsRes.affected ?? 0,
+          customers: customersRes.affected ?? 0,
+        },
+      };
+    });
+
+    return res.json({ ok: true, company_id: companyId, ...result });
+  } catch (err: any) {
+    return res.status(500).json({ message: err?.message || 'Erro ao apagar dados' });
+  }
+});
+
+companiesRouter.post('/me/danger/delete', async (req: Request, res: Response) => {
+  const companyId = await getAuthCompanyId(req);
+  if (!companyId) return res.status(400).json({ message: 'Company not configured for this user' });
+
+  const perm = await ensureOwnerOrAdmin(req, companyId);
+  if (!perm.ok) return res.status(perm.status).json({ message: perm.message });
+
+  const companyRepo = AppDataSource.getRepository(Companies);
+  const company = await companyRepo.findOne({ where: { id: companyId } as any });
+  if (!company) return res.status(404).json({ message: 'Company not found' });
+
+  const confirmName = normalizeConfirmName((req.body as any)?.confirm_name);
+  const expectedName = normalizeConfirmName(company.name);
+  if (!expectedName || confirmName !== expectedName) {
+    return res.status(400).json({
+      message: `Confirmação inválida. Digite exatamente o nome da empresa: "${expectedName}".`,
+    });
+  }
+
+  try {
+    const result = await AppDataSource.transaction(async (manager) => {
+      const groupId = company.group_id ?? null;
+
+      const orderItemsRes = await manager.getRepository(OrderItems).delete({ company_id: companyId } as any);
+      const ordersRes = await manager.getRepository(Orders).delete({ company_id: companyId } as any);
+      const productsRes = await manager.getRepository(Products).delete({ company_id: companyId } as any);
+      const customersRes = await manager.getRepository(Customers).delete({ company_id: companyId } as any);
+
+      const companyUsersRes = await manager.getRepository(CompanyUsers).delete({ company_id: companyId } as any);
+      const companyPlatformsRes = await manager.getRepository(CompanyPlatforms).delete({ company_id: companyId } as any);
+
+      const companyRes = await manager.getRepository(Companies).delete({ id: companyId } as any);
+
+      let groupDeleted = false;
+      if (groupId) {
+        const remaining = await manager.getRepository(Companies).count({ where: { group_id: groupId } as any });
+        if (remaining === 0) {
+          const groupRes = await manager.getRepository(Groups).delete({ id: groupId } as any);
+          groupDeleted = (groupRes.affected ?? 0) > 0;
+        }
+      }
+
+      return {
+        deleted: {
+          order_items: orderItemsRes.affected ?? 0,
+          orders: ordersRes.affected ?? 0,
+          products: productsRes.affected ?? 0,
+          customers: customersRes.affected ?? 0,
+          company_users: companyUsersRes.affected ?? 0,
+          company_platforms: companyPlatformsRes.affected ?? 0,
+          companies: companyRes.affected ?? 0,
+        },
+        group_deleted: groupDeleted,
+        group_id: groupId,
+      };
+    });
+
+    return res.json({ ok: true, company_id: companyId, ...result });
+  } catch (err: any) {
+    return res.status(500).json({ message: err?.message || 'Erro ao deletar empresa' });
+  }
+});
