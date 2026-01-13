@@ -106,6 +106,8 @@ jobs:
             echo "=========================================="
             echo "🚀 INICIAR CONTAINER"
             echo "=========================================="
+            docker-compose down api || true
+            docker rm movmais-api -f || true
             docker-compose up -d api
             echo ""
 
