@@ -12,6 +12,16 @@ jobs:
     steps:
       - name: "📍 Conectar ao servidor"
         uses: appleboy/ssh-action@master
+        env:
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASS: ${{ secrets.DB_PASS }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          CORS_METHODS: ${{ secrets.CORS_METHODS }}
+          CORS_HEADERS: ${{ secrets.CORS_HEADERS }}
+          CORS_ORIGINS: ${{ secrets.CORS_ORIGINS }}
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
@@ -68,15 +78,15 @@ jobs:
             
             # Criar arquivo .env com secrets usando echo
             > /opt/movmais/apps/api/.env
-            echo "DB_HOST=${{ secrets.DB_HOST }}" >> /opt/movmais/apps/api/.env
-            echo "DB_PORT=${{ secrets.DB_PORT }}" >> /opt/movmais/apps/api/.env
-            echo "DB_USER=${{ secrets.DB_USER }}" >> /opt/movmais/apps/api/.env
-            echo "DB_PASS=${{ secrets.DB_PASS }}" >> /opt/movmais/apps/api/.env
-            echo "DB_NAME=${{ secrets.DB_NAME }}" >> /opt/movmais/apps/api/.env
-            echo "JWT_SECRET=${{ secrets.JWT_SECRET }}" >> /opt/movmais/apps/api/.env
-            echo "CORS_METHODS=${{ secrets.CORS_METHODS }}" >> /opt/movmais/apps/api/.env
-            echo "CORS_HEADERS=${{ secrets.CORS_HEADERS }}" >> /opt/movmais/apps/api/.env
-            echo "CORS_ORIGINS=${{ secrets.CORS_ORIGINS }}" >> /opt/movmais/apps/api/.env
+            echo "DB_HOST=$DB_HOST" >> /opt/movmais/apps/api/.env
+            echo "DB_PORT=$DB_PORT" >> /opt/movmais/apps/api/.env
+            echo "DB_USER=$DB_USER" >> /opt/movmais/apps/api/.env
+            echo "DB_PASS=$DB_PASS" >> /opt/movmais/apps/api/.env
+            echo "DB_NAME=$DB_NAME" >> /opt/movmais/apps/api/.env
+            echo "JWT_SECRET=$JWT_SECRET" >> /opt/movmais/apps/api/.env
+            echo "CORS_METHODS=$CORS_METHODS" >> /opt/movmais/apps/api/.env
+            echo "CORS_HEADERS=$CORS_HEADERS" >> /opt/movmais/apps/api/.env
+            echo "CORS_ORIGINS=$CORS_ORIGINS" >> /opt/movmais/apps/api/.env
             echo "NODE_ENV=production" >> /opt/movmais/apps/api/.env
             
             echo "✅ Arquivo .env criado com secrets do GitHub"
