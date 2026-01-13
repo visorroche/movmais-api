@@ -68,17 +68,17 @@ jobs:
             
             # Criar arquivo .env com secrets usando sed
             cat > /tmp/env_template.txt << 'EOF'
-DB_HOST=__DB_HOST__
-DB_PORT=__DB_PORT__
-DB_USER=__DB_USER__
-DB_PASS=__DB_PASS__
-DB_NAME=__DB_NAME__
-JWT_SECRET=__JWT_SECRET__
-CORS_METHODS=__CORS_METHODS__
-CORS_HEADERS=__CORS_HEADERS__
-CORS_ORIGINS=__CORS_ORIGINS__
-NODE_ENV=production
-EOF
+            DB_HOST=__DB_HOST__
+            DB_PORT=__DB_PORT__
+            DB_USER=__DB_USER__
+            DB_PASS=__DB_PASS__
+            DB_NAME=__DB_NAME__
+            JWT_SECRET=__JWT_SECRET__
+            CORS_METHODS=__CORS_METHODS__
+            CORS_HEADERS=__CORS_HEADERS__
+            CORS_ORIGINS=__CORS_ORIGINS__
+            NODE_ENV=production
+            EOF
             
             # Substituir os placeholders com os valores dos secrets
             sed -e 's|__DB_HOST__|${{ secrets.DB_HOST }}|g' \
