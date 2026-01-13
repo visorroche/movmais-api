@@ -68,18 +68,31 @@ jobs:
             
             # Criar arquivo .env com secrets usando echo
             > /opt/movmais/apps/api/.env
-            cat > /opt/movmais/apps/api/.env << 'ENVEOF'
-DB_HOST=${{ secrets.DB_HOST }}
-DB_PORT=${{ secrets.DB_PORT }}
-DB_USER=${{ secrets.DB_USER }}
-DB_PASS=${{ secrets.DB_PASS }}
-DB_NAME=${{ secrets.DB_NAME }}
-JWT_SECRET=${{ secrets.JWT_SECRET }}
-CORS_METHODS=${{ secrets.CORS_METHODS }}
-CORS_HEADERS=${{ secrets.CORS_HEADERS }}
-CORS_ORIGINS=${{ secrets.CORS_ORIGINS }}
+            # Criar arquivo .env com secrets usando sed
+            cat > /tmp/env_template.txt << 'EOF'
+DB_HOST=__DB_HOST__
+DB_PORT=__DB_PORT__
+DB_USER=__DB_USER__
+DB_PASS=__DB_PASS__
+DB_NAME=__DB_NAME__
+JWT_SECRET=__JWT_SECRET__
+CORS_METHODS=__CORS_METHODS__
+CORS_HEADERS=__CORS_HEADERS__
+CORS_ORIGINS=__CORS_ORIGINS__
 NODE_ENV=production
-ENVEOF
+EOF
+            
+            # Substituir os placeholders com os valores dos secrets
+            sed -e 's|__DB_HOST__|${{ secrets.DB_HOST }}|g' \
+                -e 's|__DB_PORT__|${{ secrets.DB_PORT }}|g' \
+                -e 's|__DB_USER__|${{ secrets.DB_USER }}|g' \
+                -e 's|__DB_PASS__|${{ secrets.DB_PASS }}|g' \
+                -e 's|__DB_NAME__|${{ secrets.DB_NAME }}|g' \
+                -e 's|__JWT_SECRET__|${{ secrets.JWT_SECRET }}|g' \
+                -e 's|__CORS_METHODS__|${{ secrets.CORS_METHODS }}|g' \
+                -e 's|__CORS_HEADERS__|${{ secrets.CORS_HEADERS }}|g' \
+                -e 's|__CORS_ORIGINS__|${{ secrets.CORS_ORIGINS }}|g' \
+                /tmp/env_template.txt > /opt/movmais/apps/api/.env
             echo "NODE_ENV=production" >> /opt/movmais/apps/api/.env
             
             echo "✅ Arquivo .env criado com secrets do GitHub"
