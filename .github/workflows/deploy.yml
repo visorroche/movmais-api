@@ -16,8 +16,6 @@ jobs:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.DEPLOY_KEY }}
-          envs: DB_HOST,DB_PORT,DB_USER,DB_PASS,DB_NAME,JWT_SECRET,CORS_METHODS,CORS_HEADERS,CORS_ORIGINS
-          env_from_file: /tmp/api_env.txt
           script: |
             echo "=========================================="
             echo "🚀 INICIANDO DEPLOY DA API"
@@ -70,15 +68,18 @@ jobs:
             
             # Criar arquivo .env com secrets usando echo
             > /opt/movmais/apps/api/.env
-            echo "DB_HOST=$DB_HOST" >> /opt/movmais/apps/api/.env
-            echo "DB_PORT=$DB_PORT" >> /opt/movmais/apps/api/.env
-            echo "DB_USER=$DB_USER" >> /opt/movmais/apps/api/.env
-            echo "DB_PASS=$DB_PASS" >> /opt/movmais/apps/api/.env
-            echo "DB_NAME=$DB_NAME" >> /opt/movmais/apps/api/.env
-            echo "JWT_SECRET=$JWT_SECRET" >> /opt/movmais/apps/api/.env
-            echo "CORS_METHODS=$CORS_METHODS" >> /opt/movmais/apps/api/.env
-            echo "CORS_HEADERS=$CORS_HEADERS" >> /opt/movmais/apps/api/.env
-            echo "CORS_ORIGINS=$CORS_ORIGINS" >> /opt/movmais/apps/api/.env
+            cat > /opt/movmais/apps/api/.env << 'ENVEOF'
+DB_HOST=${{ secrets.DB_HOST }}
+DB_PORT=${{ secrets.DB_PORT }}
+DB_USER=${{ secrets.DB_USER }}
+DB_PASS=${{ secrets.DB_PASS }}
+DB_NAME=${{ secrets.DB_NAME }}
+JWT_SECRET=${{ secrets.JWT_SECRET }}
+CORS_METHODS=${{ secrets.CORS_METHODS }}
+CORS_HEADERS=${{ secrets.CORS_HEADERS }}
+CORS_ORIGINS=${{ secrets.CORS_ORIGINS }}
+NODE_ENV=production
+ENVEOF
             echo "NODE_ENV=production" >> /opt/movmais/apps/api/.env
             
             echo "✅ Arquivo .env criado com secrets do GitHub"
