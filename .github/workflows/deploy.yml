@@ -73,6 +73,7 @@ jobs:
             DB_USER=__DB_USER__
             DB_PASS=__DB_PASS__
             DB_NAME=__DB_NAME__
+            DB_SSL=true
             JWT_SECRET=__JWT_SECRET__
             CORS_METHODS=__CORS_METHODS__
             CORS_HEADERS=__CORS_HEADERS__
