@@ -65,16 +65,45 @@ jobs:
             echo "=========================================="
             echo "📝 CRIAR ARQUIVO .ENV COM SECRETS"
             echo "=========================================="
-            cat > /opt/movmais/apps/api/.env << 'ENVEOF'
-            DB_HOST=${{ secrets.DB_HOST }}
-            DB_PORT=${{ secrets.DB_PORT }}
-            DB_DATABASE=${{ secrets.DB_DATABASE }}
-            DB_USERNAME=${{ secrets.DB_USERNAME }}
-            DB_PASSWORD=${{ secrets.DB_PASSWORD }}
-            PORT=${{ secrets.PORT }}
-            NODE_ENV=production
-            ENVEOF
+            
+            # Criar script de injeção dinâmica
+            cat > /tmp/inject_secrets.sh << 'INJECT_SCRIPT'
+#!/bin/bash
+ENV_EXAMPLE_FILE="$1"
+ENV_OUTPUT_FILE="$2"
+> "$ENV_OUTPUT_FILE"
+while IFS='=' read -r VAR_NAME VAR_VALUE; do
+    [[ -z "$VAR_NAME" || "$VAR_NAME" =~ ^# ]] && continue
+    VAR_NAME=$(echo "$VAR_NAME" | xargs)
+    SECRET_VALUE="${!VAR_NAME}"
+    if [ -z "$SECRET_VALUE" ]; then
+        echo "$VAR_NAME=$VAR_VALUE" >> "$ENV_OUTPUT_FILE"
+    else
+        echo "$VAR_NAME=$SECRET_VALUE" >> "$ENV_OUTPUT_FILE"
+    fi
+done < "$ENV_EXAMPLE_FILE"
+INJECT_SCRIPT
+            
+            chmod +x /tmp/inject_secrets.sh
+            
+            # Executar script com os secrets como variáveis de ambiente
+            export DB_HOST="${{ secrets.DB_HOST }}"
+            export DB_PORT="${{ secrets.DB_PORT }}"
+            export DB_USER="${{ secrets.DB_USER }}"
+            export DB_PASS="${{ secrets.DB_PASS }}"
+            export DB_NAME="${{ secrets.DB_NAME }}"
+            export JWT_SECRET="${{ secrets.JWT_SECRET }}"
+            export CORS_METHODS="${{ secrets.CORS_METHODS }}"
+            export CORS_HEADERS="${{ secrets.CORS_HEADERS }}"
+            export CORS_ORIGINS="${{ secrets.CORS_ORIGINS }}"
+            
+            /tmp/inject_secrets.sh /opt/movmais/apps/api/.env.example /opt/movmais/apps/api/.env
             echo "✅ Arquivo .env criado com secrets do GitHub"
+            echo ""
+            
+            # Debug: mostrar variáveis injetadas
+            echo "📍 Variáveis no .env:"
+            cat /opt/movmais/apps/api/.env
             echo ""
 
             echo "=========================================="
