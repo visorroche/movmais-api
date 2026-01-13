@@ -45,9 +45,9 @@ router.get('/version', (req: Request, res: Response) => {
   if (!version) {
     return res
       .status(404)
-      .json({ version: null, error: 'api/version.txt não encontrado ou vazio', file });
+      .json({ version: null, project: 'api', error: 'api/version.txt não encontrado ou vazio', file });
   }
-  return res.json({ version });
+  return res.json({ version, project: 'api' });
 });
 
 router.use('/users', usersRouter);
