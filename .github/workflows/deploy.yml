@@ -71,7 +71,7 @@ jobs:
             DB_DATABASE=${{ secrets.DB_DATABASE }}
             DB_USERNAME=${{ secrets.DB_USERNAME }}
             DB_PASSWORD=${{ secrets.DB_PASSWORD }}
-            API_PORT=${{ secrets.PORT }}
+            PORT=${{ secrets.PORT }}
             NODE_ENV=production
             ENVEOF
             echo "✅ Arquivo .env criado com secrets do GitHub"
