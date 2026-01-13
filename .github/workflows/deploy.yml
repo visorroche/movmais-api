@@ -21,16 +21,16 @@ jobs:
             echo "🚀 INICIANDO DEPLOY DA API"
             echo "=========================================="
             echo ""
-            
+
             echo "📍 Data/Hora do deploy"
             date
             echo ""
-            
+
             echo "📍 Verificar diretório"
             pwd
             ls -la /opt/movmais/apps/
             echo ""
-            
+
             echo "📍 Versão atual no servidor (ANTES do deploy)"
             cd /opt/movmais/apps/api
             echo "Commit atual:"
@@ -38,48 +38,63 @@ jobs:
             echo "Branch:"
             git branch
             echo ""
-            
+
             echo "📍 Atualizar código do GitHub"
             git fetch origin
             echo "Commits disponíveis:"
             git log -3 --oneline
             echo ""
-            
+
             echo "📍 Fazer reset hard para origin/main"
             git reset --hard origin/main
             echo "✅ Reset concluído"
             echo ""
-            
+
             echo "📍 Versão APÓS git reset"
             git log -1 --oneline
             echo ""
-            
+
             echo "📍 Verificar arquivos alterados"
             git status
             echo ""
-            
+
             echo "📍 Verificar conteúdo de arquivo importante (package.json)"
             head -5 package.json
             echo ""
-            
+
+            echo "=========================================="
+            echo "📝 CRIAR ARQUIVO .ENV COM SECRETS"
+            echo "=========================================="
+            cat > /opt/movmais/apps/api/.env << 'ENVEOF'
+            DB_HOST=${{ secrets.DB_HOST }}
+            DB_PORT=${{ secrets.DB_PORT }}
+            DB_DATABASE=${{ secrets.DB_DATABASE }}
+            DB_USERNAME=${{ secrets.DB_USERNAME }}
+            DB_PASSWORD=${{ secrets.DB_PASSWORD }}
+            API_PORT=${{ secrets.PORT }}
+            NODE_ENV=production
+            ENVEOF
+            echo "✅ Arquivo .env criado com secrets do GitHub"
+            echo ""
+
             echo "=========================================="
             echo "🐳 DOCKER BUILD"
             echo "=========================================="
             cd /opt/movmais
             echo ""
-            
+
             echo "📍 Remover imagem antiga"
             docker rmi movmais-api -f || echo "Nenhuma imagem anterior"
             echo ""
-            
+
             echo "📍 Parar container antigo"
             docker-compose stop api || echo "Container não estava rodando"
             echo ""
-            
+
             echo "📍 Iniciar build (sem cache)"
             docker-compose build --no-cache api
             BUILD_STATUS=$?
-            
+
             if [ $BUILD_STATUS -eq 0 ]; then
               echo "✅ BUILD SUCESSO"
             else
@@ -87,47 +102,47 @@ jobs:
               exit 1
             fi
             echo ""
-            
+
             echo "=========================================="
             echo "🚀 INICIAR CONTAINER"
             echo "=========================================="
             docker-compose up -d api
             echo ""
-            
+
             echo "📍 Aguardar 5 segundos para container iniciar"
             sleep 5
             echo ""
-            
+
             echo "📍 Status dos containers"
             docker-compose ps
             echo ""
-            
+
             echo "📍 Logs do container (últimas 30 linhas)"
             docker logs movmais-api | tail -30
             echo ""
-            
+
             echo "=========================================="
             echo "✅ VERIFICAÇÕES FINAIS"
             echo "=========================================="
-            
+
             echo "📍 Verificar versão no servidor (APÓS deploy)"
             cd /opt/movmais/apps/api
             echo "Commit atual:"
             git log -1 --oneline
             echo ""
-            
+
             echo "📍 Verificar se container está rodando"
             docker-compose ps api
             echo ""
-            
+
             echo "📍 Testar acesso à API"
             curl -s -I http://127.0.0.1:5003/ | head -3
             echo ""
-            
+
             echo "📍 Verificar porta 5003 está aberta"
             netstat -tlnp | grep 5003 || echo "⚠️ Porta 5003 não encontrada"
             echo ""
-            
+
             echo "=========================================="
             echo "✅ DEPLOY CONCLUÍDO COM SUCESSO!"
             echo "=========================================="
