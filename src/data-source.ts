@@ -12,6 +12,7 @@ import { Customers } from './entities/Customers';
 import { Orders } from './entities/Orders';
 import { OrderItems } from './entities/OrderItems';
 import { Products } from './entities/Products';
+import { Logs } from './entities/Logs';
 
 export const AppDataSource = new DataSource({
   type: 'postgres',
@@ -23,8 +24,8 @@ export const AppDataSource = new DataSource({
   // IMPORTANTE:
   // Não habilite synchronize em banco com dados/tabelas já existentes.
   // Isso pode causar ALTER/DROP indesejado (ex.: tentar remover colunas).
-  // Por padrão fica ligado (bom para dev). Para desligar explicitamente: TYPEORM_SYNC=false
-  synchronize: process.env.TYPEORM_SYNC === 'false' ? false : true,
+  // Por padrão fica desligado. Para ligar explicitamente (apenas dev): TYPEORM_SYNC=true
+  synchronize: process.env.TYPEORM_SYNC === 'true' ? true : false,
   logging: false,
-  entities: [Users, Companies, Groups, Platforms, CompanyPlatforms, CompanyUsers, Customers, Orders, OrderItems, Products],
+  entities: [Users, Companies, Groups, Platforms, CompanyPlatforms, CompanyUsers, Customers, Orders, OrderItems, Products, Logs],
 });
