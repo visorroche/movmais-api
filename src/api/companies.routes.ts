@@ -88,6 +88,7 @@ companiesRouter.get('/me/dashboard/filters', async (req: Request, res: Response)
   const condSql = groupId ? 'c.group_id = $1' : 'o.company_id = $1';
   const condSqlProducts = groupId ? 'c.group_id = $1' : 'p.company_id = $1';
   const param = groupId ?? companyId;
+  const channelsFrom = String((req.query as any)?.channelsFrom ?? 'orders').trim(); // 'orders' | 'freight_quotes'
 
   const [stores, statuses, channels, categories, states, cities] = await Promise.all([
     AppDataSource.query(
@@ -105,13 +106,19 @@ companiesRouter.get('/me/dashboard/filters', async (req: Request, res: Response)
       [param],
     ),
     AppDataSource.query(
-      `SELECT DISTINCT UPPER(TRIM(fq.channel)) AS value
-       FROM freight_quotes fq
-       JOIN companies c ON c.id = fq.company_id
-       WHERE ${groupId ? 'c.group_id = $1' : 'fq.company_id = $1'}
-         AND fq.channel IS NOT NULL
-         AND TRIM(fq.channel) <> ''
-       ORDER BY value ASC`,
+      channelsFrom === 'freight_quotes'
+        ? `SELECT DISTINCT UPPER(TRIM(fq.channel)) AS value
+           FROM freight_quotes fq
+           JOIN companies c ON c.id = fq.company_id
+           WHERE ${groupId ? 'c.group_id = $1' : 'fq.company_id = $1'}
+             AND fq.channel IS NOT NULL
+             AND TRIM(fq.channel) <> ''
+           ORDER BY value ASC`
+        : `SELECT DISTINCT COALESCE(o.marketplace_name, o.channel) AS value
+           FROM orders o
+           JOIN companies c ON c.id = o.company_id
+           WHERE ${condSql} AND COALESCE(o.marketplace_name, o.channel) IS NOT NULL
+           ORDER BY value ASC`,
       [param],
     ),
     AppDataSource.query(
@@ -426,6 +433,420 @@ companiesRouter.get('/me/dashboard/revenue', async (req: Request, res: Response)
     conversionRate,
     daily,
   });
+});
+
+companiesRouter.get('/me/dashboard/live/overview', async (req: Request, res: Response) => {
+  const userId = await getAuthUserId(req);
+  if (!userId) return res.status(401).json({ message: 'Não autenticado' });
+
+  const filter = await getAuthCompanyGroupFilter(req);
+  if (!filter) return res.status(400).json({ message: 'Company not configured for this user' });
+
+  const { companyId, groupId } = filter;
+  const param = groupId ?? companyId;
+  const condOrders = groupId ? 'c.group_id = $1' : 'o.company_id = $1';
+
+  const toStringArray = (v: any): string[] => {
+    if (!v) return [];
+    const raw = Array.isArray(v) ? v : [v];
+    return raw.map((x) => String(x).trim()).filter(Boolean);
+  };
+
+  const channels = toStringArray((req.query as any)?.channel);
+  const categories = toStringArray((req.query as any)?.category);
+  const states = toStringArray((req.query as any)?.state).map((s) => s.toUpperCase());
+  const cities = toStringArray((req.query as any)?.city);
+  const skus = toStringArray((req.query as any)?.sku);
+  const companyIds = toStringArray((req.query as any)?.company_id)
+    .map((s) => Number(s))
+    .filter((n) => Number.isInteger(n) && n > 0);
+
+  // regra: se filtrar por categoria/SKU, o faturamento deve vir do item (unit_price * quantity)
+  const useItemsRevenue = Boolean(categories.length || skus.length);
+
+  try {
+    // IMPORTANTE:
+    // - Retorna tudo como TEXT (YYYY-MM-DD) para evitar "GMT-0300" vindo do parser do driver.
+    // - Usa "America/Sao_Paulo" para "agora" e datas de referência, evitando divergência quando o Postgres está em UTC.
+    const metaRows = await AppDataSource.query(
+      `
+      SELECT
+        to_char(((now() AT TIME ZONE 'America/Sao_Paulo')::date), 'YYYY-MM-DD') AS today,
+        to_char((((now() AT TIME ZONE 'America/Sao_Paulo')::date) - 1), 'YYYY-MM-DD') AS yesterday,
+        to_char((((now() AT TIME ZONE 'America/Sao_Paulo')::date) - 7), 'YYYY-MM-DD') AS d7,
+        to_char((((now() AT TIME ZONE 'America/Sao_Paulo')::date) - 14), 'YYYY-MM-DD') AS d14,
+        to_char((((now() AT TIME ZONE 'America/Sao_Paulo')::date) - 21), 'YYYY-MM-DD') AS d21,
+        to_char((((now() AT TIME ZONE 'America/Sao_Paulo')::date) - 28), 'YYYY-MM-DD') AS d28,
+        to_char((((now() AT TIME ZONE 'America/Sao_Paulo')::date) - 8), 'YYYY-MM-DD') AS d8,
+        EXTRACT(HOUR FROM (now() AT TIME ZONE 'America/Sao_Paulo'))::int AS current_hour
+      `,
+    );
+    const meta = metaRows?.[0] || {};
+    const today = String(meta.today || '').trim();
+    const yesterday = String(meta.yesterday || '').trim();
+    const d7 = String(meta.d7 || '').trim();
+    const d14 = String(meta.d14 || '').trim();
+    const d21 = String(meta.d21 || '').trim();
+    const d28 = String(meta.d28 || '').trim();
+    const d8 = String(meta.d8 || '').trim();
+    const currentHour = Number(meta.current_hour ?? 0) || 0;
+
+    const days = [today, yesterday, d7, d14, d21, d28, d8];
+
+    const commonParams: any[] = [param, days];
+    const where: string[] = [
+      `${condOrders}`,
+      `o.order_date IS NOT NULL`,
+      `o.order_date::date = ANY($2::date[])`,
+    ];
+    if (groupId && companyIds.length) {
+      commonParams.push(companyIds);
+      where.push(`o.company_id = ANY($${commonParams.length}::int[])`);
+    }
+    if (channels.length) {
+      commonParams.push(channels);
+      where.push(`COALESCE(o.marketplace_name, o.channel) = ANY($${commonParams.length}::text[])`);
+    }
+    if (states.length) {
+      commonParams.push(states);
+      where.push(`UPPER(TRIM(o.delivery_state)) = ANY($${commonParams.length}::text[])`);
+    }
+    if (cities.length) {
+      commonParams.push(cities);
+      where.push(`o.delivery_city = ANY($${commonParams.length}::text[])`);
+    }
+
+    // 1) Receita por hora (cumulativa será montada no front)
+    const hourlyRows = await AppDataSource.query(
+      useItemsRevenue
+        ? `
+          SELECT
+            to_char(o.order_date::date, 'YYYY-MM-DD') AS day,
+            EXTRACT(HOUR FROM o.order_date)::int AS hour,
+            COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric AS revenue
+          FROM orders o
+          JOIN companies c ON c.id = o.company_id
+          JOIN order_items i ON i.order_id = o.id
+          JOIN products p ON p.id = i.product_id
+          WHERE ${where.join(' AND ')}
+            AND (CASE WHEN $${commonParams.length + 1}::text[] IS NULL OR array_length($${commonParams.length + 1}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${commonParams.length + 1}::text[]) END)
+            AND (CASE WHEN $${commonParams.length + 2}::text[] IS NULL OR array_length($${commonParams.length + 2}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${commonParams.length + 2}::text[]) END)
+          GROUP BY o.order_date::date, 2
+          ORDER BY o.order_date::date ASC, 2 ASC
+        `
+        : `
+          SELECT
+            to_char(o.order_date::date, 'YYYY-MM-DD') AS day,
+            EXTRACT(HOUR FROM o.order_date)::int AS hour,
+            COALESCE(SUM(
+              COALESCE(o.total_amount::numeric, 0)
+              - COALESCE(o.total_discount::numeric, 0)
+              + COALESCE(o.shipping_amount::numeric, 0)
+            ), 0)::numeric AS revenue
+          FROM orders o
+          JOIN companies c ON c.id = o.company_id
+          WHERE ${where.join(' AND ')}
+          GROUP BY o.order_date::date, 2
+          ORDER BY o.order_date::date ASC, 2 ASC
+        `,
+      useItemsRevenue ? [...commonParams, categories.length ? categories : null, skus.length ? skus : null] : commonParams,
+    );
+
+    // 2) KPIs por dia (para escolher "Ontem/D-7/etc" no front)
+    const kpiRows = await AppDataSource.query(
+      useItemsRevenue
+        ? `
+          SELECT
+            to_char(o.order_date::date, 'YYYY-MM-DD') AS day,
+            COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric AS revenue,
+            COUNT(DISTINCT o.id)::int AS orders,
+            COUNT(DISTINCT o.customer_id)::int AS customers,
+            COALESCE(SUM(i.quantity::int), 0)::int AS items_sold
+          FROM orders o
+          JOIN companies c ON c.id = o.company_id
+          JOIN order_items i ON i.order_id = o.id
+          JOIN products p ON p.id = i.product_id
+          WHERE ${where.join(' AND ')}
+            AND (CASE WHEN $${commonParams.length + 1}::text[] IS NULL OR array_length($${commonParams.length + 1}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${commonParams.length + 1}::text[]) END)
+            AND (CASE WHEN $${commonParams.length + 2}::text[] IS NULL OR array_length($${commonParams.length + 2}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${commonParams.length + 2}::text[]) END)
+          GROUP BY o.order_date::date
+          ORDER BY o.order_date::date ASC
+        `
+        : `
+          SELECT
+            to_char(o.order_date::date, 'YYYY-MM-DD') AS day,
+            COALESCE(SUM(
+              COALESCE(o.total_amount::numeric, 0)
+              - COALESCE(o.total_discount::numeric, 0)
+              + COALESCE(o.shipping_amount::numeric, 0)
+            ), 0)::numeric AS revenue,
+            COUNT(DISTINCT o.id)::int AS orders,
+            COUNT(DISTINCT o.customer_id)::int AS customers,
+            0::int AS items_sold
+          FROM orders o
+          JOIN companies c ON c.id = o.company_id
+          WHERE ${where.join(' AND ')}
+          GROUP BY o.order_date::date
+          ORDER BY o.order_date::date ASC
+        `,
+      useItemsRevenue ? [...commonParams, categories.length ? categories : null, skus.length ? skus : null] : commonParams,
+    );
+
+    // 3) Itens vendidos por dia (mesmo quando revenue vem de orders)
+    const itemsSoldRows = useItemsRevenue
+      ? []
+      : await AppDataSource.query(
+          `
+          SELECT
+            to_char(o.order_date::date, 'YYYY-MM-DD') AS day,
+            COALESCE(SUM(i.quantity::int), 0)::int AS items_sold
+          FROM orders o
+          JOIN companies c ON c.id = o.company_id
+          JOIN order_items i ON i.order_id = o.id
+          WHERE ${where.join(' AND ')}
+          GROUP BY o.order_date::date
+          ORDER BY o.order_date::date ASC
+        `,
+          commonParams,
+        );
+
+    // 4) Breakdown (hoje)
+    const dayParamsBase: any[] = [param, today];
+    const whereToday: string[] = [
+      `${condOrders}`,
+      `o.order_date IS NOT NULL`,
+      `o.order_date::date = $2::date`,
+    ];
+    if (groupId && companyIds.length) {
+      dayParamsBase.push(companyIds);
+      whereToday.push(`o.company_id = ANY($${dayParamsBase.length}::int[])`);
+    }
+    if (channels.length) {
+      dayParamsBase.push(channels);
+      whereToday.push(`COALESCE(o.marketplace_name, o.channel) = ANY($${dayParamsBase.length}::text[])`);
+    }
+    if (states.length) {
+      dayParamsBase.push(states);
+      whereToday.push(`UPPER(TRIM(o.delivery_state)) = ANY($${dayParamsBase.length}::text[])`);
+    }
+    if (cities.length) {
+      dayParamsBase.push(cities);
+      whereToday.push(`o.delivery_city = ANY($${dayParamsBase.length}::text[])`);
+    }
+
+    const byMarketplace = await AppDataSource.query(
+      useItemsRevenue
+        ? `
+          SELECT
+            COALESCE(NULLIF(TRIM(COALESCE(o.marketplace_name, o.channel)), ''), '(sem marketplace)') AS id,
+            COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric AS value
+          FROM orders o
+          JOIN companies c ON c.id = o.company_id
+          JOIN order_items i ON i.order_id = o.id
+          JOIN products p ON p.id = i.product_id
+          WHERE ${whereToday.join(' AND ')}
+            AND (CASE WHEN $${dayParamsBase.length + 1}::text[] IS NULL OR array_length($${dayParamsBase.length + 1}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${dayParamsBase.length + 1}::text[]) END)
+            AND (CASE WHEN $${dayParamsBase.length + 2}::text[] IS NULL OR array_length($${dayParamsBase.length + 2}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${dayParamsBase.length + 2}::text[]) END)
+          GROUP BY 1
+          ORDER BY value DESC, id ASC
+        `
+        : `
+          SELECT
+            COALESCE(NULLIF(TRIM(COALESCE(o.marketplace_name, o.channel)), ''), '(sem marketplace)') AS id,
+            COALESCE(SUM(
+              COALESCE(o.total_amount::numeric, 0)
+              - COALESCE(o.total_discount::numeric, 0)
+              + COALESCE(o.shipping_amount::numeric, 0)
+            ), 0)::numeric AS value
+          FROM orders o
+          JOIN companies c ON c.id = o.company_id
+          WHERE ${whereToday.join(' AND ')}
+          GROUP BY 1
+          ORDER BY value DESC, id ASC
+        `,
+      useItemsRevenue ? [...dayParamsBase, categories.length ? categories : null, skus.length ? skus : null] : dayParamsBase,
+    );
+
+    const byState = await AppDataSource.query(
+      useItemsRevenue
+        ? `
+          SELECT
+            COALESCE(NULLIF(TRIM(UPPER(o.delivery_state)), ''), '(sem UF)') AS id,
+            COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric AS value
+          FROM orders o
+          JOIN companies c ON c.id = o.company_id
+          JOIN order_items i ON i.order_id = o.id
+          JOIN products p ON p.id = i.product_id
+          WHERE ${whereToday.join(' AND ')}
+            AND (CASE WHEN $${dayParamsBase.length + 1}::text[] IS NULL OR array_length($${dayParamsBase.length + 1}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${dayParamsBase.length + 1}::text[]) END)
+            AND (CASE WHEN $${dayParamsBase.length + 2}::text[] IS NULL OR array_length($${dayParamsBase.length + 2}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${dayParamsBase.length + 2}::text[]) END)
+          GROUP BY 1
+          ORDER BY value DESC, id ASC
+        `
+        : `
+          SELECT
+            COALESCE(NULLIF(TRIM(UPPER(o.delivery_state)), ''), '(sem UF)') AS id,
+            COALESCE(SUM(
+              COALESCE(o.total_amount::numeric, 0)
+              - COALESCE(o.total_discount::numeric, 0)
+              + COALESCE(o.shipping_amount::numeric, 0)
+            ), 0)::numeric AS value
+          FROM orders o
+          JOIN companies c ON c.id = o.company_id
+          WHERE ${whereToday.join(' AND ')}
+          GROUP BY 1
+          ORDER BY value DESC, id ASC
+        `,
+      useItemsRevenue ? [...dayParamsBase, categories.length ? categories : null, skus.length ? skus : null] : dayParamsBase,
+    );
+
+    const byCategory = await AppDataSource.query(
+      `
+      SELECT
+        COALESCE(NULLIF(TRIM(COALESCE(p.final_category, p.category)), ''), '(sem categoria)') AS id,
+        COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric AS value
+      FROM orders o
+      JOIN companies c ON c.id = o.company_id
+      JOIN order_items i ON i.order_id = o.id
+      JOIN products p ON p.id = i.product_id
+      WHERE ${whereToday.join(' AND ')}
+        AND (CASE WHEN $${dayParamsBase.length + 1}::text[] IS NULL OR array_length($${dayParamsBase.length + 1}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${dayParamsBase.length + 1}::text[]) END)
+        AND (CASE WHEN $${dayParamsBase.length + 2}::text[] IS NULL OR array_length($${dayParamsBase.length + 2}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${dayParamsBase.length + 2}::text[]) END)
+      GROUP BY 1
+      ORDER BY value DESC, id ASC
+      `,
+      [...dayParamsBase, categories.length ? categories : null, skus.length ? skus : null],
+    );
+
+    const topProducts = await AppDataSource.query(
+      `
+      SELECT
+        p.sku AS sku,
+        MAX(p.name) AS name,
+        COALESCE(SUM(i.quantity::int), 0)::int AS qty,
+        COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric AS revenue
+      FROM orders o
+      JOIN companies c ON c.id = o.company_id
+      JOIN order_items i ON i.order_id = o.id
+      JOIN products p ON p.id = i.product_id
+      WHERE ${whereToday.join(' AND ')}
+        AND (CASE WHEN $${dayParamsBase.length + 1}::text[] IS NULL OR array_length($${dayParamsBase.length + 1}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${dayParamsBase.length + 1}::text[]) END)
+        AND (CASE WHEN $${dayParamsBase.length + 2}::text[] IS NULL OR array_length($${dayParamsBase.length + 2}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${dayParamsBase.length + 2}::text[]) END)
+      GROUP BY 1
+      ORDER BY revenue DESC NULLS LAST
+      LIMIT 20
+      `,
+      [...dayParamsBase, categories.length ? categories : null, skus.length ? skus : null],
+    );
+
+    // Normaliza KPIs e calcula "so far" usando currentHour via hourlyRows
+    const revenueByDayHour = new Map<string, Map<number, number>>();
+    for (const r of hourlyRows || []) {
+      const day = String((r as any).day);
+      const hour = Number((r as any).hour ?? 0);
+      const rev = Number((r as any).revenue ?? 0) || 0;
+      if (!revenueByDayHour.has(day)) revenueByDayHour.set(day, new Map());
+      revenueByDayHour.get(day)!.set(hour, rev);
+    }
+    const sumSoFar = (day: string): number => {
+      const m = revenueByDayHour.get(day);
+      if (!m) return 0;
+      let acc = 0;
+      for (let h = 0; h <= Math.min(23, Math.max(0, currentHour)); h++) acc += Number(m.get(h) ?? 0) || 0;
+      return acc;
+    };
+    const sumDay = (day: string): number => {
+      const m = revenueByDayHour.get(day);
+      if (!m) return 0;
+      let acc = 0;
+      for (let h = 0; h < 24; h++) acc += Number(m.get(h) ?? 0) || 0;
+      return acc;
+    };
+
+    const kpiByDay = new Map<string, any>();
+    for (const r of kpiRows || []) {
+      const day = String((r as any).day);
+      kpiByDay.set(day, {
+        revenue: Number((r as any).revenue ?? 0) || 0,
+        orders: Number((r as any).orders ?? 0) || 0,
+        customers: Number((r as any).customers ?? 0) || 0,
+        itemsSold: Number((r as any).items_sold ?? 0) || 0,
+      });
+    }
+    if (!useItemsRevenue) {
+      for (const r of itemsSoldRows || []) {
+        const day = String((r as any).day);
+        const cur = kpiByDay.get(day) || { revenue: 0, orders: 0, customers: 0, itemsSold: 0 };
+        cur.itemsSold = Number((r as any).items_sold ?? 0) || 0;
+        kpiByDay.set(day, cur);
+      }
+    }
+    const makeKpi = (day: string) => {
+      const base = kpiByDay.get(day) || { revenue: 0, orders: 0, customers: 0, itemsSold: 0 };
+      const revenueSoFar = sumSoFar(day);
+      const orders = Number(base.orders) || 0;
+      return {
+        revenueSoFar,
+        revenueDay: sumDay(day),
+        orders,
+        uniqueCustomers: Number(base.customers) || 0,
+        itemsSold: Number(base.itemsSold) || 0,
+        avgTicket: orders > 0 ? revenueSoFar / orders : 0,
+        cartItemsAdded: 0,
+        conversionPct: 0,
+      };
+    };
+
+    const kToday = makeKpi(today);
+    const kYesterday = makeKpi(yesterday);
+    const kD7 = makeKpi(d7);
+    const kD14 = makeKpi(d14);
+    const kD21 = makeKpi(d21);
+    const kD28 = makeKpi(d28);
+    const kD8 = makeKpi(d8);
+
+    // Projeção: mesma lógica do mock (D-7 do dia * crescimento de Ontem vs Ontem (D-7))
+    const lastWeekSameDayTotal = kD7.revenueDay;
+    const yesterdayTotal = kYesterday.revenueDay;
+    const lastWeekYesterdayTotal = kD8.revenueDay;
+    const growth = lastWeekYesterdayTotal > 0 ? yesterdayTotal / lastWeekYesterdayTotal : 0;
+    const projectedTodayTotal = growth > 0 ? lastWeekSameDayTotal * growth : 0;
+
+    return res.json({
+      companyId,
+      groupId,
+      today,
+      currentHour,
+      useItemsRevenue,
+      kpis: {
+        today: kToday,
+        yesterday: kYesterday,
+        d7: kD7,
+        d14: kD14,
+        d21: kD21,
+        d28: kD28,
+      },
+      projection: {
+        projectedTodayTotal,
+      },
+      hourly: (hourlyRows || []).map((r: any) => ({
+        day: String(r.day),
+        hour: Number(r.hour ?? 0) || 0,
+        revenue: Number(r.revenue ?? 0) || 0,
+      })),
+      topProducts: (topProducts || []).map((r: any) => ({
+        sku: String(r.sku ?? ''),
+        name: r.name ?? null,
+        qty: Number(r.qty ?? 0) || 0,
+        revenue: Number(r.revenue ?? 0) || 0,
+      })),
+      byMarketplace: (byMarketplace || []).map((r: any) => ({ id: String(r.id), value: Number(r.value ?? 0) || 0 })),
+      byCategory: (byCategory || []).map((r: any) => ({ id: String(r.id), value: Number(r.value ?? 0) || 0 })),
+      byState: (byState || []).map((r: any) => ({ id: String(r.id), value: Number(r.value ?? 0) || 0 })),
+    });
+  } catch (err: any) {
+    return res.status(500).json({ message: err?.message || 'Erro ao carregar Ao Vivo' });
+  }
 });
 
 companiesRouter.get('/me/dashboard/simulations/daily', async (req: Request, res: Response) => {
@@ -834,6 +1255,210 @@ companiesRouter.get('/me/dashboard/simulations/by-state', async (req: Request, r
     });
   } catch (err: any) {
     return res.status(500).json({ message: err?.message || 'Erro ao buscar simulações por estado' });
+  }
+});
+
+companiesRouter.get('/me/dashboard/items/overview', async (req: Request, res: Response) => {
+  const userId = await getAuthUserId(req);
+  if (!userId) return res.status(401).json({ message: 'Não autenticado' });
+
+  const filter = await getAuthCompanyGroupFilter(req);
+  if (!filter) return res.status(400).json({ message: 'Company not configured for this user' });
+
+  const start = String((req.query as any)?.start ?? '').trim();
+  const end = String((req.query as any)?.end ?? '').trim();
+  if (!isIsoYmd(start) || !isIsoYmd(end)) {
+    return res.status(400).json({ message: 'Parâmetros inválidos: start/end devem estar em YYYY-MM-DD.' });
+  }
+
+  const { companyId, groupId } = filter;
+  const param = groupId ?? companyId;
+  const condOrders = groupId ? 'c.group_id = $1' : 'o.company_id = $1';
+
+  const toStringArray = (v: any): string[] => {
+    if (!v) return [];
+    const raw = Array.isArray(v) ? v : [v];
+    return raw.map((x) => String(x).trim()).filter(Boolean);
+  };
+
+  const statuses = toStringArray((req.query as any)?.status);
+  const channels = toStringArray((req.query as any)?.channel);
+  const categories = toStringArray((req.query as any)?.category);
+  const states = toStringArray((req.query as any)?.state).map((s) => s.toUpperCase());
+  const cities = toStringArray((req.query as any)?.city);
+  const skus = toStringArray((req.query as any)?.sku);
+  const companyIds = toStringArray((req.query as any)?.company_id)
+    .map((s) => Number(s))
+    .filter((n) => Number.isInteger(n) && n > 0);
+
+  try {
+    const params: any[] = [param, start, end];
+    const where: string[] = [
+      `${condOrders}`,
+      `o.order_date IS NOT NULL`,
+      `o.order_date::date BETWEEN $2::date AND $3::date`,
+    ];
+
+    if (companyIds.length) {
+      params.push(companyIds);
+      where.push(`o.company_id = ANY($${params.length}::int[])`);
+    }
+    if (statuses.length) {
+      params.push(statuses);
+      where.push(`o.current_status = ANY($${params.length}::text[])`);
+    }
+    if (channels.length) {
+      params.push(channels);
+      where.push(`COALESCE(o.marketplace_name, o.channel) = ANY($${params.length}::text[])`);
+    }
+    if (states.length) {
+      params.push(states);
+      where.push(`UPPER(TRIM(o.delivery_state)) = ANY($${params.length}::text[])`);
+    }
+    if (cities.length) {
+      params.push(cities);
+      where.push(`o.delivery_city = ANY($${params.length}::text[])`);
+    }
+    if (categories.length) {
+      params.push(categories);
+      where.push(`COALESCE(p.final_category, p.category) = ANY($${params.length}::text[])`);
+    }
+    if (skus.length) {
+      params.push(skus);
+      where.push(`p.sku = ANY($${params.length}::text[])`);
+    }
+
+    const sqlBase = `
+      WITH base AS (
+        SELECT
+          o.order_date::date AS day,
+          o.channel AS channel,
+          COALESCE(o.marketplace_name, o.channel) AS marketplace,
+          UPPER(TRIM(o.delivery_state)) AS delivery_state,
+          o.delivery_city AS delivery_city,
+          o.current_status AS current_status,
+          (i.unit_price::numeric) AS unit_price,
+          (i.quantity::int) AS quantity,
+          ((i.unit_price::numeric) * (i.quantity::int)) AS revenue,
+          COALESCE(NULLIF(TRIM(p.category), ''), '(sem categoria)') AS category,
+          COALESCE(NULLIF(TRIM(p.subcategory), ''), '(sem sub-categoria)') AS subcategory,
+          COALESCE(NULLIF(TRIM(p.final_category), ''), NULLIF(TRIM(p.category), ''), '(sem categoria)') AS final_category,
+          COALESCE(NULLIF(TRIM(p.brand), ''), '(sem marca)') AS brand,
+          p.sku AS sku,
+          p.name AS name
+        FROM orders o
+        JOIN order_items i ON i.order_id = o.id
+        JOIN products p ON p.id = i.product_id
+        JOIN companies c ON c.id = o.company_id
+        WHERE ${where.join(' AND ')}
+      ),
+      top_final AS (
+        SELECT final_category, SUM(revenue)::numeric AS revenue
+        FROM base
+        GROUP BY 1
+        ORDER BY revenue DESC
+        LIMIT 6
+      ),
+      days AS (
+        SELECT generate_series($2::date, $3::date, '1 day'::interval)::date AS day
+      ),
+      daily AS (
+        SELECT
+          to_char(d.day, 'DD/MM') AS date,
+          tf.final_category AS final_category,
+          COALESCE(SUM(b.revenue), 0)::numeric AS revenue
+        FROM days d
+        JOIN top_final tf ON TRUE
+        LEFT JOIN base b ON b.day = d.day AND b.final_category = tf.final_category
+        GROUP BY d.day, tf.final_category
+        ORDER BY d.day ASC
+      ),
+      category_totals AS (
+        SELECT category, SUM(revenue)::numeric AS revenue
+        FROM base
+        GROUP BY 1
+        ORDER BY revenue DESC
+      ),
+      final_category_totals AS (
+        SELECT category, final_category, SUM(revenue)::numeric AS revenue
+        FROM base
+        GROUP BY 1, 2
+        ORDER BY revenue DESC
+      ),
+      top_products AS (
+        SELECT
+          sku,
+          MAX(name) AS name,
+          SUM(quantity)::int AS qty,
+          SUM(revenue)::numeric AS revenue
+        FROM base
+        WHERE sku IS NOT NULL AND TRIM(sku) <> ''
+        GROUP BY 1
+        ORDER BY revenue DESC
+        LIMIT 20
+      ),
+      by_channel AS (
+        -- "Marketplace" vem de orders.marketplace_name (fallback para orders.channel)
+        SELECT COALESCE(NULLIF(TRIM(marketplace), ''), '(sem marketplace)') AS channel, SUM(revenue)::numeric AS revenue
+        FROM base
+        GROUP BY 1
+        ORDER BY revenue DESC
+      ),
+      by_brand AS (
+        SELECT brand, SUM(revenue)::numeric AS revenue
+        FROM base
+        GROUP BY 1
+        ORDER BY revenue DESC
+      ),
+      by_state AS (
+        SELECT COALESCE(NULLIF(TRIM(delivery_state), ''), '(sem UF)') AS state, SUM(revenue)::numeric AS revenue
+        FROM base
+        GROUP BY 1
+        ORDER BY revenue DESC
+      ),
+      treemap_rows AS (
+        SELECT
+          category,
+          subcategory,
+          final_category,
+          COALESCE(NULLIF(TRIM(sku), ''), '(sem sku)') AS sku,
+          MAX(name) AS name,
+          SUM(revenue)::numeric AS revenue
+        FROM base
+        GROUP BY 1,2,3,4
+        ORDER BY revenue DESC
+        LIMIT 2500
+      )
+      SELECT
+        (SELECT jsonb_agg(jsonb_build_object('final_category', tf.final_category, 'revenue', tf.revenue) ORDER BY tf.revenue DESC) FROM top_final tf) AS top_final_categories,
+        (SELECT jsonb_agg(jsonb_build_object('date', d.date, 'final_category', d.final_category, 'revenue', d.revenue) ORDER BY d.date ASC) FROM daily d) AS daily_by_final_category,
+        (SELECT jsonb_agg(jsonb_build_object('category', ct.category, 'revenue', ct.revenue) ORDER BY ct.revenue DESC) FROM category_totals ct) AS category_totals,
+        (SELECT jsonb_agg(jsonb_build_object('category', fct.category, 'final_category', fct.final_category, 'revenue', fct.revenue) ORDER BY fct.revenue DESC) FROM final_category_totals fct) AS final_category_totals,
+        (SELECT jsonb_agg(jsonb_build_object('sku', tp.sku, 'name', tp.name, 'qty', tp.qty, 'revenue', tp.revenue) ORDER BY tp.revenue DESC) FROM top_products tp) AS top_products,
+        (SELECT jsonb_agg(jsonb_build_object('channel', bc.channel, 'revenue', bc.revenue) ORDER BY bc.revenue DESC) FROM by_channel bc) AS by_channel,
+        (SELECT jsonb_agg(jsonb_build_object('brand', bb.brand, 'revenue', bb.revenue) ORDER BY bb.revenue DESC) FROM by_brand bb) AS by_brand,
+        (SELECT jsonb_agg(jsonb_build_object('state', bs.state, 'revenue', bs.revenue) ORDER BY bs.revenue DESC) FROM by_state bs) AS by_state,
+        (SELECT jsonb_agg(jsonb_build_object('category', tr.category, 'subcategory', tr.subcategory, 'final_category', tr.final_category, 'sku', tr.sku, 'name', tr.name, 'revenue', tr.revenue) ORDER BY tr.revenue DESC) FROM treemap_rows tr) AS treemap_rows
+    `;
+
+    const [row] = await AppDataSource.query(sqlBase, params);
+    return res.json({
+      companyId,
+      groupId,
+      start,
+      end,
+      topFinalCategories: row?.top_final_categories ?? [],
+      dailyByFinalCategory: row?.daily_by_final_category ?? [],
+      categoryTotals: row?.category_totals ?? [],
+      finalCategoryTotals: row?.final_category_totals ?? [],
+      topProducts: row?.top_products ?? [],
+      byChannel: row?.by_channel ?? [],
+      byBrand: row?.by_brand ?? [],
+      byState: row?.by_state ?? [],
+      treemapRows: row?.treemap_rows ?? [],
+    });
+  } catch (err: any) {
+    return res.status(500).json({ message: err?.message || 'Erro ao carregar itens (overview)' });
   }
 });
 
