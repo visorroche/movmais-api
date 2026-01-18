@@ -358,18 +358,36 @@ companiesRouter.get('/me/dashboard/revenue', async (req: Request, res: Response)
 
   const condSqlFq = groupId ? 'c.group_id = $1' : 'fq.company_id = $1';
 
-  const [todayRows, periodRows, dailyRows, ordersCountRows, quotesCountRows] = await Promise.all([
+  // regra de "faturamento" usada no resto do dashboard: total_amount - total_discount + shipping_amount
+  const revenueExpr = `
+    (COALESCE(o.total_amount, 0)::numeric
+     - COALESCE(o.total_discount, 0)::numeric
+     + COALESCE(o.shipping_amount, 0)::numeric)
+  `;
+
+  const growthOffsets = [1, 7, 14, 21, 28];
+
+  const [
+    todayRows,
+    periodRows,
+    dailyRows,
+    ordersCountRows,
+    quotesCountRows,
+    uniqueCustomersRows,
+    byMarketplaceRows,
+    ...growthRowsList
+  ] = await Promise.all([
     AppDataSource.query(
-      `SELECT COALESCE(SUM(o.total_amount), 0) AS total
+      `SELECT COALESCE(SUM(${revenueExpr}), 0) AS total
        FROM orders o
        JOIN companies c ON c.id = o.company_id
        WHERE ${condSql}
          AND o.order_date IS NOT NULL
-         AND o.order_date::date = CURRENT_DATE`,
+         AND o.order_date::date = ((now() AT TIME ZONE 'America/Sao_Paulo')::date)`,
       [param],
     ),
     AppDataSource.query(
-      `SELECT COALESCE(SUM(o.total_amount), 0) AS total
+      `SELECT COALESCE(SUM(${revenueExpr}), 0) AS total
        FROM orders o
        JOIN companies c ON c.id = o.company_id
        WHERE ${condSql}
@@ -381,7 +399,7 @@ companiesRouter.get('/me/dashboard/revenue', async (req: Request, res: Response)
       `SELECT
          o.order_date::date AS day_date,
          to_char(o.order_date::date, 'DD/MM/YYYY') AS day,
-         COALESCE(SUM(o.total_amount), 0) AS total
+         COALESCE(SUM(${revenueExpr}), 0) AS total
        FROM orders o
        JOIN companies c ON c.id = o.company_id
        WHERE ${condSql}
@@ -409,17 +427,72 @@ companiesRouter.get('/me/dashboard/revenue', async (req: Request, res: Response)
          AND fq.quoted_at::date BETWEEN $2::date AND $3::date`,
       [param, start, end],
     ),
+    AppDataSource.query(
+      `SELECT COUNT(DISTINCT o.customer_id) AS total
+       FROM orders o
+       JOIN companies c ON c.id = o.company_id
+       WHERE ${condSql}
+         AND o.order_date IS NOT NULL
+         AND o.order_date::date BETWEEN $2::date AND $3::date
+         AND o.customer_id IS NOT NULL`,
+      [param, start, end],
+    ),
+    AppDataSource.query(
+      `SELECT
+         COALESCE(NULLIF(TRIM(COALESCE(o.marketplace_name, o.channel)), ''), 'Sem canal') AS marketplace,
+         COUNT(*)::int AS orders_count,
+         COALESCE(SUM(${revenueExpr}), 0) AS revenue
+       FROM orders o
+       JOIN companies c ON c.id = o.company_id
+       WHERE ${condSql}
+         AND o.order_date IS NOT NULL
+         AND o.order_date::date BETWEEN $2::date AND $3::date
+       GROUP BY 1
+       ORDER BY revenue DESC, marketplace ASC`,
+      [param, start, end],
+    ),
+    ...growthOffsets.map((offsetDays) =>
+      AppDataSource.query(
+        `SELECT COALESCE(SUM(${revenueExpr}), 0) AS total
+         FROM orders o
+         JOIN companies c ON c.id = o.company_id
+         WHERE ${condSql}
+           AND o.order_date IS NOT NULL
+           AND o.order_date::date BETWEEN ($2::date - $4::int) AND ($3::date - $4::int)`,
+        [param, start, end, offsetDays],
+      ),
+    ),
   ]);
 
   const todayTotal = Number((todayRows?.[0] as any)?.total ?? 0) || 0;
   const periodTotal = Number((periodRows?.[0] as any)?.total ?? 0) || 0;
   const ordersCount = Number((ordersCountRows?.[0] as any)?.total ?? 0) || 0;
   const quotesCount = Number((quotesCountRows?.[0] as any)?.total ?? 0) || 0;
+  const uniqueCustomers = Number((uniqueCustomersRows?.[0] as any)?.total ?? 0) || 0;
   const conversionRate = quotesCount > 0 ? ordersCount / quotesCount : 0;
   const daily = (dailyRows || []).map((r: any) => ({
     date: String(r.day), // DD/MM/YYYY (para o gráfico)
     total: Number(r.total ?? 0) || 0,
   }));
+
+  const avgTicket = ordersCount > 0 ? periodTotal / ordersCount : 0;
+
+  const byMarketplace = (byMarketplaceRows || []).map((r: any) => {
+    const revenue = Number(r.revenue ?? 0) || 0;
+    const ordersCount = Number(r.orders_count ?? 0) || 0;
+    return {
+      marketplace: String(r.marketplace || 'Sem canal'),
+      revenue,
+      ordersCount,
+      avgTicket: ordersCount > 0 ? revenue / ordersCount : 0,
+    };
+  });
+
+  const growth = growthOffsets.map((offsetDays, idx) => {
+    const prev = Number((growthRowsList?.[idx]?.[0] as any)?.total ?? 0) || 0;
+    const value = prev > 0 ? (periodTotal - prev) / prev : null;
+    return { offsetDays, label: `D-${offsetDays}`, value, previous: prev, current: periodTotal };
+  });
 
   return res.json({
     companyId,
@@ -431,6 +504,10 @@ companiesRouter.get('/me/dashboard/revenue', async (req: Request, res: Response)
     ordersCount,
     quotesCount,
     conversionRate,
+    uniqueCustomers,
+    avgTicket,
+    growth,
+    byMarketplace,
     daily,
   });
 });
@@ -465,23 +542,39 @@ companiesRouter.get('/me/dashboard/live/overview', async (req: Request, res: Res
   const useItemsRevenue = Boolean(categories.length || skus.length);
 
   try {
+    const baseDayRaw = String((req.query as any)?.day ?? '').trim();
+    const baseDay = baseDayRaw ? baseDayRaw : null;
+    if (baseDay && !isIsoYmd(baseDay)) {
+      return res.status(400).json({ message: 'Parâmetro inválido: day deve estar em YYYY-MM-DD.' });
+    }
+
     // IMPORTANTE:
     // - Retorna tudo como TEXT (YYYY-MM-DD) para evitar "GMT-0300" vindo do parser do driver.
     // - Usa "America/Sao_Paulo" para "agora" e datas de referência, evitando divergência quando o Postgres está em UTC.
     const metaRows = await AppDataSource.query(
       `
+      WITH x AS (
+        SELECT
+          (now() AT TIME ZONE 'America/Sao_Paulo')::date AS actual_today,
+          COALESCE($1::date, (now() AT TIME ZONE 'America/Sao_Paulo')::date) AS base_day
+      )
       SELECT
-        to_char(((now() AT TIME ZONE 'America/Sao_Paulo')::date), 'YYYY-MM-DD') AS today,
-        to_char((((now() AT TIME ZONE 'America/Sao_Paulo')::date) - 1), 'YYYY-MM-DD') AS yesterday,
-        to_char((((now() AT TIME ZONE 'America/Sao_Paulo')::date) - 7), 'YYYY-MM-DD') AS d7,
-        to_char((((now() AT TIME ZONE 'America/Sao_Paulo')::date) - 14), 'YYYY-MM-DD') AS d14,
-        to_char((((now() AT TIME ZONE 'America/Sao_Paulo')::date) - 21), 'YYYY-MM-DD') AS d21,
-        to_char((((now() AT TIME ZONE 'America/Sao_Paulo')::date) - 28), 'YYYY-MM-DD') AS d28,
-        to_char((((now() AT TIME ZONE 'America/Sao_Paulo')::date) - 8), 'YYYY-MM-DD') AS d8,
-        EXTRACT(HOUR FROM (now() AT TIME ZONE 'America/Sao_Paulo'))::int AS current_hour
+        to_char(actual_today, 'YYYY-MM-DD') AS actual_today,
+        to_char(base_day, 'YYYY-MM-DD') AS today,
+        to_char((base_day - 1), 'YYYY-MM-DD') AS yesterday,
+        to_char((base_day - 7), 'YYYY-MM-DD') AS d7,
+        to_char((base_day - 14), 'YYYY-MM-DD') AS d14,
+        to_char((base_day - 21), 'YYYY-MM-DD') AS d21,
+        to_char((base_day - 28), 'YYYY-MM-DD') AS d28,
+        to_char((base_day - 8), 'YYYY-MM-DD') AS d8,
+        (base_day = actual_today) AS is_live,
+        CASE WHEN base_day = actual_today THEN EXTRACT(HOUR FROM (now() AT TIME ZONE 'America/Sao_Paulo'))::int ELSE 23 END AS current_hour
+      FROM x
       `,
+      [baseDay],
     );
     const meta = metaRows?.[0] || {};
+    const actualToday = String(meta.actual_today || '').trim();
     const today = String(meta.today || '').trim();
     const yesterday = String(meta.yesterday || '').trim();
     const d7 = String(meta.d7 || '').trim();
@@ -490,6 +583,11 @@ companiesRouter.get('/me/dashboard/live/overview', async (req: Request, res: Res
     const d28 = String(meta.d28 || '').trim();
     const d8 = String(meta.d8 || '').trim();
     const currentHour = Number(meta.current_hour ?? 0) || 0;
+    const isLive = Boolean(meta.is_live);
+
+    if (baseDay && actualToday && baseDay > actualToday) {
+      return res.status(400).json({ message: `Parâmetro inválido: day não pode ser maior que hoje (${actualToday}).` });
+    }
 
     const days = [today, yesterday, d7, d14, d21, d28, d8];
 
@@ -561,7 +659,8 @@ companiesRouter.get('/me/dashboard/live/overview', async (req: Request, res: Res
             COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric AS revenue,
             COUNT(DISTINCT o.id)::int AS orders,
             COUNT(DISTINCT o.customer_id)::int AS customers,
-            COALESCE(SUM(i.quantity::int), 0)::int AS items_sold
+            COALESCE(SUM(i.quantity::int), 0)::int AS items_sold,
+            COUNT(DISTINCT p.sku)::int AS skus_count
           FROM orders o
           JOIN companies c ON c.id = o.company_id
           JOIN order_items i ON i.order_id = o.id
@@ -582,7 +681,8 @@ companiesRouter.get('/me/dashboard/live/overview', async (req: Request, res: Res
             ), 0)::numeric AS revenue,
             COUNT(DISTINCT o.id)::int AS orders,
             COUNT(DISTINCT o.customer_id)::int AS customers,
-            0::int AS items_sold
+            0::int AS items_sold,
+            0::int AS skus_count
           FROM orders o
           JOIN companies c ON c.id = o.company_id
           WHERE ${where.join(' AND ')}
@@ -603,6 +703,25 @@ companiesRouter.get('/me/dashboard/live/overview', async (req: Request, res: Res
           FROM orders o
           JOIN companies c ON c.id = o.company_id
           JOIN order_items i ON i.order_id = o.id
+          WHERE ${where.join(' AND ')}
+          GROUP BY o.order_date::date
+          ORDER BY o.order_date::date ASC
+        `,
+          commonParams,
+        );
+
+    // 3b) SKUs distintos por dia (mesmo quando revenue vem de orders)
+    const skusCountRows = useItemsRevenue
+      ? []
+      : await AppDataSource.query(
+          `
+          SELECT
+            to_char(o.order_date::date, 'YYYY-MM-DD') AS day,
+            COUNT(DISTINCT p.sku)::int AS skus_count
+          FROM orders o
+          JOIN companies c ON c.id = o.company_id
+          JOIN order_items i ON i.order_id = o.id
+          JOIN products p ON p.id = i.product_id
           WHERE ${where.join(' AND ')}
           GROUP BY o.order_date::date
           ORDER BY o.order_date::date ASC
@@ -639,6 +758,7 @@ companiesRouter.get('/me/dashboard/live/overview', async (req: Request, res: Res
         ? `
           SELECT
             COALESCE(NULLIF(TRIM(COALESCE(o.marketplace_name, o.channel)), ''), '(sem marketplace)') AS id,
+            COUNT(DISTINCT o.id)::int AS orders_count,
             COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric AS value
           FROM orders o
           JOIN companies c ON c.id = o.company_id
@@ -653,6 +773,7 @@ companiesRouter.get('/me/dashboard/live/overview', async (req: Request, res: Res
         : `
           SELECT
             COALESCE(NULLIF(TRIM(COALESCE(o.marketplace_name, o.channel)), ''), '(sem marketplace)') AS id,
+            COUNT(*)::int AS orders_count,
             COALESCE(SUM(
               COALESCE(o.total_amount::numeric, 0)
               - COALESCE(o.total_discount::numeric, 0)
@@ -667,11 +788,84 @@ companiesRouter.get('/me/dashboard/live/overview', async (req: Request, res: Res
       useItemsRevenue ? [...dayParamsBase, categories.length ? categories : null, skus.length ? skus : null] : dayParamsBase,
     );
 
+    const toMarketplaceTable = (rows: any[]) =>
+      (rows || []).map((r: any) => {
+        const revenue = Number(r.value ?? 0) || 0;
+        const ordersCount = Number(r.orders_count ?? 0) || 0;
+        return { id: String(r.id), revenue, ordersCount, avgTicket: ordersCount > 0 ? revenue / ordersCount : 0 };
+      });
+
+    const fetchByMarketplaceForDay = async (dayYmd: string) => {
+      const dayParams: any[] = [param, dayYmd];
+      const whereDay: string[] = [`${condOrders}`, `o.order_date IS NOT NULL`, `o.order_date::date = $2::date`];
+      if (groupId && companyIds.length) {
+        dayParams.push(companyIds);
+        whereDay.push(`o.company_id = ANY($${dayParams.length}::int[])`);
+      }
+      if (channels.length) {
+        dayParams.push(channels);
+        whereDay.push(`COALESCE(o.marketplace_name, o.channel) = ANY($${dayParams.length}::text[])`);
+      }
+      if (states.length) {
+        dayParams.push(states);
+        whereDay.push(`UPPER(TRIM(o.delivery_state)) = ANY($${dayParams.length}::text[])`);
+      }
+      if (cities.length) {
+        dayParams.push(cities);
+        whereDay.push(`o.delivery_city = ANY($${dayParams.length}::text[])`);
+      }
+
+      const rows = await AppDataSource.query(
+        useItemsRevenue
+          ? `
+            SELECT
+              COALESCE(NULLIF(TRIM(COALESCE(o.marketplace_name, o.channel)), ''), '(sem marketplace)') AS id,
+              COUNT(DISTINCT o.id)::int AS orders_count,
+              COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric AS value
+            FROM orders o
+            JOIN companies c ON c.id = o.company_id
+            JOIN order_items i ON i.order_id = o.id
+            JOIN products p ON p.id = i.product_id
+            WHERE ${whereDay.join(' AND ')}
+              AND (CASE WHEN $${dayParams.length + 1}::text[] IS NULL OR array_length($${dayParams.length + 1}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${dayParams.length + 1}::text[]) END)
+              AND (CASE WHEN $${dayParams.length + 2}::text[] IS NULL OR array_length($${dayParams.length + 2}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${dayParams.length + 2}::text[]) END)
+            GROUP BY 1
+            ORDER BY value DESC, id ASC
+          `
+          : `
+            SELECT
+              COALESCE(NULLIF(TRIM(COALESCE(o.marketplace_name, o.channel)), ''), '(sem marketplace)') AS id,
+              COUNT(*)::int AS orders_count,
+              COALESCE(SUM(
+                COALESCE(o.total_amount::numeric, 0)
+                - COALESCE(o.total_discount::numeric, 0)
+                + COALESCE(o.shipping_amount::numeric, 0)
+              ), 0)::numeric AS value
+            FROM orders o
+            JOIN companies c ON c.id = o.company_id
+            WHERE ${whereDay.join(' AND ')}
+            GROUP BY 1
+            ORDER BY value DESC, id ASC
+          `,
+        useItemsRevenue ? [...dayParams, categories.length ? categories : null, skus.length ? skus : null] : dayParams,
+      );
+      return toMarketplaceTable(rows);
+    };
+
+    const [bmYesterday, bmD7, bmD14, bmD21, bmD28] = await Promise.all([
+      fetchByMarketplaceForDay(yesterday),
+      fetchByMarketplaceForDay(d7),
+      fetchByMarketplaceForDay(d14),
+      fetchByMarketplaceForDay(d21),
+      fetchByMarketplaceForDay(d28),
+    ]);
+
     const byState = await AppDataSource.query(
       useItemsRevenue
         ? `
           SELECT
             COALESCE(NULLIF(TRIM(UPPER(o.delivery_state)), ''), '(sem UF)') AS id,
+            COUNT(DISTINCT o.id)::int AS orders_count,
             COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric AS value
           FROM orders o
           JOIN companies c ON c.id = o.company_id
@@ -686,6 +880,7 @@ companiesRouter.get('/me/dashboard/live/overview', async (req: Request, res: Res
         : `
           SELECT
             COALESCE(NULLIF(TRIM(UPPER(o.delivery_state)), ''), '(sem UF)') AS id,
+            COUNT(*)::int AS orders_count,
             COALESCE(SUM(
               COALESCE(o.total_amount::numeric, 0)
               - COALESCE(o.total_discount::numeric, 0)
@@ -704,6 +899,7 @@ companiesRouter.get('/me/dashboard/live/overview', async (req: Request, res: Res
       `
       SELECT
         COALESCE(NULLIF(TRIM(COALESCE(p.final_category, p.category)), ''), '(sem categoria)') AS id,
+        COUNT(DISTINCT o.id)::int AS orders_count,
         COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric AS value
       FROM orders o
       JOIN companies c ON c.id = o.company_id
@@ -718,11 +914,196 @@ companiesRouter.get('/me/dashboard/live/overview', async (req: Request, res: Res
       [...dayParamsBase, categories.length ? categories : null, skus.length ? skus : null],
     );
 
+    const toStateTable = (rows: any[]) =>
+      (rows || []).map((r: any) => {
+        const revenue = Number(r.value ?? 0) || 0;
+        const ordersCount = Number(r.orders_count ?? 0) || 0;
+        return { id: String(r.id), revenue, ordersCount, avgTicket: ordersCount > 0 ? revenue / ordersCount : 0 };
+      });
+
+    const toCategoryTable = (rows: any[]) =>
+      (rows || []).map((r: any) => {
+        const revenue = Number(r.value ?? 0) || 0;
+        const ordersCount = Number(r.orders_count ?? 0) || 0;
+        return { id: String(r.id), revenue, ordersCount, avgTicket: ordersCount > 0 ? revenue / ordersCount : 0 };
+      });
+
+    const fetchByStateForDay = async (dayYmd: string) => {
+      const dayParams: any[] = [param, dayYmd];
+      const whereDay: string[] = [`${condOrders}`, `o.order_date IS NOT NULL`, `o.order_date::date = $2::date`];
+      if (groupId && companyIds.length) {
+        dayParams.push(companyIds);
+        whereDay.push(`o.company_id = ANY($${dayParams.length}::int[])`);
+      }
+      if (channels.length) {
+        dayParams.push(channels);
+        whereDay.push(`COALESCE(o.marketplace_name, o.channel) = ANY($${dayParams.length}::text[])`);
+      }
+      if (states.length) {
+        dayParams.push(states);
+        whereDay.push(`UPPER(TRIM(o.delivery_state)) = ANY($${dayParams.length}::text[])`);
+      }
+      if (cities.length) {
+        dayParams.push(cities);
+        whereDay.push(`o.delivery_city = ANY($${dayParams.length}::text[])`);
+      }
+
+      const rows = await AppDataSource.query(
+        useItemsRevenue
+          ? `
+            SELECT
+              COALESCE(NULLIF(TRIM(UPPER(o.delivery_state)), ''), '(sem UF)') AS id,
+              COUNT(DISTINCT o.id)::int AS orders_count,
+              COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric AS value
+            FROM orders o
+            JOIN companies c ON c.id = o.company_id
+            JOIN order_items i ON i.order_id = o.id
+            JOIN products p ON p.id = i.product_id
+            WHERE ${whereDay.join(' AND ')}
+              AND (CASE WHEN $${dayParams.length + 1}::text[] IS NULL OR array_length($${dayParams.length + 1}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${dayParams.length + 1}::text[]) END)
+              AND (CASE WHEN $${dayParams.length + 2}::text[] IS NULL OR array_length($${dayParams.length + 2}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${dayParams.length + 2}::text[]) END)
+            GROUP BY 1
+            ORDER BY value DESC, id ASC
+          `
+          : `
+            SELECT
+              COALESCE(NULLIF(TRIM(UPPER(o.delivery_state)), ''), '(sem UF)') AS id,
+              COUNT(*)::int AS orders_count,
+              COALESCE(SUM(
+                COALESCE(o.total_amount::numeric, 0)
+                - COALESCE(o.total_discount::numeric, 0)
+                + COALESCE(o.shipping_amount::numeric, 0)
+              ), 0)::numeric AS value
+            FROM orders o
+            JOIN companies c ON c.id = o.company_id
+            WHERE ${whereDay.join(' AND ')}
+            GROUP BY 1
+            ORDER BY value DESC, id ASC
+          `,
+        useItemsRevenue ? [...dayParams, categories.length ? categories : null, skus.length ? skus : null] : dayParams,
+      );
+      return toStateTable(rows);
+    };
+
+    const fetchByCategoryForDay = async (dayYmd: string) => {
+      const dayParams: any[] = [param, dayYmd];
+      const whereDay: string[] = [`${condOrders}`, `o.order_date IS NOT NULL`, `o.order_date::date = $2::date`];
+      if (groupId && companyIds.length) {
+        dayParams.push(companyIds);
+        whereDay.push(`o.company_id = ANY($${dayParams.length}::int[])`);
+      }
+      if (channels.length) {
+        dayParams.push(channels);
+        whereDay.push(`COALESCE(o.marketplace_name, o.channel) = ANY($${dayParams.length}::text[])`);
+      }
+      if (states.length) {
+        dayParams.push(states);
+        whereDay.push(`UPPER(TRIM(o.delivery_state)) = ANY($${dayParams.length}::text[])`);
+      }
+      if (cities.length) {
+        dayParams.push(cities);
+        whereDay.push(`o.delivery_city = ANY($${dayParams.length}::text[])`);
+      }
+
+      const rows = await AppDataSource.query(
+        `
+          SELECT
+            COALESCE(NULLIF(TRIM(COALESCE(p.final_category, p.category)), ''), '(sem categoria)') AS id,
+            COUNT(DISTINCT o.id)::int AS orders_count,
+            COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric AS value
+          FROM orders o
+          JOIN companies c ON c.id = o.company_id
+          JOIN order_items i ON i.order_id = o.id
+          JOIN products p ON p.id = i.product_id
+          WHERE ${whereDay.join(' AND ')}
+            AND (CASE WHEN $${dayParams.length + 1}::text[] IS NULL OR array_length($${dayParams.length + 1}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${dayParams.length + 1}::text[]) END)
+            AND (CASE WHEN $${dayParams.length + 2}::text[] IS NULL OR array_length($${dayParams.length + 2}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${dayParams.length + 2}::text[]) END)
+          GROUP BY 1
+          ORDER BY value DESC, id ASC
+        `,
+        [...dayParams, categories.length ? categories : null, skus.length ? skus : null],
+      );
+      return toCategoryTable(rows);
+    };
+
+    const fetchByProductForDay = async (dayYmd: string) => {
+      const dayParams: any[] = [param, dayYmd];
+      const whereDay: string[] = [`${condOrders}`, `o.order_date IS NOT NULL`, `o.order_date::date = $2::date`];
+      if (groupId && companyIds.length) {
+        dayParams.push(companyIds);
+        whereDay.push(`o.company_id = ANY($${dayParams.length}::int[])`);
+      }
+      if (channels.length) {
+        dayParams.push(channels);
+        whereDay.push(`COALESCE(o.marketplace_name, o.channel) = ANY($${dayParams.length}::text[])`);
+      }
+      if (states.length) {
+        dayParams.push(states);
+        whereDay.push(`UPPER(TRIM(o.delivery_state)) = ANY($${dayParams.length}::text[])`);
+      }
+      if (cities.length) {
+        dayParams.push(cities);
+        whereDay.push(`o.delivery_city = ANY($${dayParams.length}::text[])`);
+      }
+
+      const rows = await AppDataSource.query(
+        `
+          SELECT
+            MAX(p.id)::int AS product_id,
+            p.sku AS sku,
+            MAX(p.name) AS name,
+            COUNT(DISTINCT o.id)::int AS orders_count,
+            COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric AS revenue
+          FROM orders o
+          JOIN companies c ON c.id = o.company_id
+          JOIN order_items i ON i.order_id = o.id
+          JOIN products p ON p.id = i.product_id
+          WHERE ${whereDay.join(' AND ')}
+            AND (CASE WHEN $${dayParams.length + 1}::text[] IS NULL OR array_length($${dayParams.length + 1}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${dayParams.length + 1}::text[]) END)
+            AND (CASE WHEN $${dayParams.length + 2}::text[] IS NULL OR array_length($${dayParams.length + 2}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${dayParams.length + 2}::text[]) END)
+          GROUP BY p.sku
+          ORDER BY revenue DESC NULLS LAST, sku ASC
+        `,
+        [...dayParams, categories.length ? categories : null, skus.length ? skus : null],
+      );
+
+      return (rows || []).map((r: any) => {
+        const revenue = Number(r.revenue ?? 0) || 0;
+        const ordersCount = Number(r.orders_count ?? 0) || 0;
+        return {
+          productId: Number(r.product_id ?? 0) || null,
+          sku: String(r.sku ?? ''),
+          name: r.name ?? null,
+          revenue,
+          ordersCount,
+          avgTicket: ordersCount > 0 ? revenue / ordersCount : 0,
+        };
+      });
+    };
+
+    const [prodToday, prodYesterday, stateYesterday, stateD7, stateD14, stateD21, stateD28, catYesterday, catD7, catD14, catD21, catD28] = await Promise.all([
+      fetchByProductForDay(today),
+      fetchByProductForDay(yesterday),
+      fetchByStateForDay(yesterday),
+      fetchByStateForDay(d7),
+      fetchByStateForDay(d14),
+      fetchByStateForDay(d21),
+      fetchByStateForDay(d28),
+      fetchByCategoryForDay(yesterday),
+      fetchByCategoryForDay(d7),
+      fetchByCategoryForDay(d14),
+      fetchByCategoryForDay(d21),
+      fetchByCategoryForDay(d28),
+    ]);
+
     const topProducts = await AppDataSource.query(
       `
       SELECT
+        MAX(p.id)::int AS product_id,
         p.sku AS sku,
         MAX(p.name) AS name,
+        MAX(p.photo) AS photo,
+        MAX(p.url) AS url,
         COALESCE(SUM(i.quantity::int), 0)::int AS qty,
         COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric AS revenue
       FROM orders o
@@ -732,7 +1113,7 @@ companiesRouter.get('/me/dashboard/live/overview', async (req: Request, res: Res
       WHERE ${whereToday.join(' AND ')}
         AND (CASE WHEN $${dayParamsBase.length + 1}::text[] IS NULL OR array_length($${dayParamsBase.length + 1}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${dayParamsBase.length + 1}::text[]) END)
         AND (CASE WHEN $${dayParamsBase.length + 2}::text[] IS NULL OR array_length($${dayParamsBase.length + 2}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${dayParamsBase.length + 2}::text[]) END)
-      GROUP BY 1
+      GROUP BY p.sku
       ORDER BY revenue DESC NULLS LAST
       LIMIT 20
       `,
@@ -771,18 +1152,25 @@ companiesRouter.get('/me/dashboard/live/overview', async (req: Request, res: Res
         orders: Number((r as any).orders ?? 0) || 0,
         customers: Number((r as any).customers ?? 0) || 0,
         itemsSold: Number((r as any).items_sold ?? 0) || 0,
+        skusCount: Number((r as any).skus_count ?? 0) || 0,
       });
     }
     if (!useItemsRevenue) {
       for (const r of itemsSoldRows || []) {
         const day = String((r as any).day);
-        const cur = kpiByDay.get(day) || { revenue: 0, orders: 0, customers: 0, itemsSold: 0 };
+        const cur = kpiByDay.get(day) || { revenue: 0, orders: 0, customers: 0, itemsSold: 0, skusCount: 0 };
         cur.itemsSold = Number((r as any).items_sold ?? 0) || 0;
+        kpiByDay.set(day, cur);
+      }
+      for (const r of skusCountRows || []) {
+        const day = String((r as any).day);
+        const cur = kpiByDay.get(day) || { revenue: 0, orders: 0, customers: 0, itemsSold: 0, skusCount: 0 };
+        cur.skusCount = Number((r as any).skus_count ?? 0) || 0;
         kpiByDay.set(day, cur);
       }
     }
     const makeKpi = (day: string) => {
-      const base = kpiByDay.get(day) || { revenue: 0, orders: 0, customers: 0, itemsSold: 0 };
+      const base = kpiByDay.get(day) || { revenue: 0, orders: 0, customers: 0, itemsSold: 0, skusCount: 0 };
       const revenueSoFar = sumSoFar(day);
       const orders = Number(base.orders) || 0;
       return {
@@ -791,6 +1179,7 @@ companiesRouter.get('/me/dashboard/live/overview', async (req: Request, res: Res
         orders,
         uniqueCustomers: Number(base.customers) || 0,
         itemsSold: Number(base.itemsSold) || 0,
+        skusCount: Number(base.skusCount) || 0,
         avgTicket: orders > 0 ? revenueSoFar / orders : 0,
         cartItemsAdded: 0,
         conversionPct: 0,
@@ -817,6 +1206,7 @@ companiesRouter.get('/me/dashboard/live/overview', async (req: Request, res: Res
       groupId,
       today,
       currentHour,
+      isLive,
       useItemsRevenue,
       kpis: {
         today: kToday,
@@ -827,7 +1217,7 @@ companiesRouter.get('/me/dashboard/live/overview', async (req: Request, res: Res
         d28: kD28,
       },
       projection: {
-        projectedTodayTotal,
+        projectedTodayTotal: isLive ? projectedTodayTotal : 0,
       },
       hourly: (hourlyRows || []).map((r: any) => ({
         day: String(r.day),
@@ -835,14 +1225,46 @@ companiesRouter.get('/me/dashboard/live/overview', async (req: Request, res: Res
         revenue: Number(r.revenue ?? 0) || 0,
       })),
       topProducts: (topProducts || []).map((r: any) => ({
+        productId: Number(r.product_id ?? 0) || null,
         sku: String(r.sku ?? ''),
         name: r.name ?? null,
+        photo: r.photo ?? null,
+        url: r.url ?? null,
         qty: Number(r.qty ?? 0) || 0,
         revenue: Number(r.revenue ?? 0) || 0,
       })),
       byMarketplace: (byMarketplace || []).map((r: any) => ({ id: String(r.id), value: Number(r.value ?? 0) || 0 })),
+      byMarketplaceTable: toMarketplaceTable(byMarketplace),
+      byMarketplaceTableByPeriod: {
+        today: toMarketplaceTable(byMarketplace),
+        yesterday: bmYesterday,
+        d7: bmD7,
+        d14: bmD14,
+        d21: bmD21,
+        d28: bmD28,
+      },
       byCategory: (byCategory || []).map((r: any) => ({ id: String(r.id), value: Number(r.value ?? 0) || 0 })),
       byState: (byState || []).map((r: any) => ({ id: String(r.id), value: Number(r.value ?? 0) || 0 })),
+      byCategoryTable: toCategoryTable(byCategory),
+      byCategoryTableByPeriod: {
+        today: toCategoryTable(byCategory),
+        yesterday: catYesterday,
+        d7: catD7,
+        d14: catD14,
+        d21: catD21,
+        d28: catD28,
+      },
+      byStateTable: toStateTable(byState),
+      byStateTableByPeriod: {
+        today: toStateTable(byState),
+        yesterday: stateYesterday,
+        d7: stateD7,
+        d14: stateD14,
+        d21: stateD21,
+        d28: stateD28,
+      },
+      byProductTable: prodToday,
+      byProductTableD1: prodYesterday,
     });
   } catch (err: any) {
     return res.status(500).json({ message: err?.message || 'Erro ao carregar Ao Vivo' });
@@ -1762,6 +2184,8 @@ companiesRouter.get('/me/products', async (req: Request, res: Response) => {
       brand: p.brand ?? null,
       model: p.model ?? null,
       category: p.final_category ?? p.category ?? null,
+      photo: p.photo ?? null,
+      url: p.url ?? null,
     })),
   );
 });
