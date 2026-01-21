@@ -12,6 +12,8 @@ import { Customers } from '../entities/Customers';
 import { Orders } from '../entities/Orders';
 import { OrderItems } from '../entities/OrderItems';
 import { Products } from '../entities/Products';
+import fs from 'fs';
+import path from 'path';
 
 export const companiesRouter = Router();
 
@@ -66,6 +68,80 @@ async function getAuthCompanyId(req: Request): Promise<number | null> {
   return companyId;
 }
 
+function safeTrimOrNull(v: unknown): string | null {
+  if (v === undefined || v === null) return null;
+  const s = String(v).trim();
+  return s.length ? s : null;
+}
+
+function loadPromptFile(relFromSrc: string): string {
+  const candidates = [
+    // rodando via ts-node-dev (cwd = api/)
+    path.join(process.cwd(), 'src', relFromSrc),
+    // rodando via dist (cwd = api/, __dirname = dist/api)
+    path.join(process.cwd(), 'dist', relFromSrc),
+    // fallback relativo ao arquivo compilado
+    path.join(__dirname, '..', relFromSrc),
+  ];
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) return fs.readFileSync(p, 'utf8');
+    } catch {
+      // ignore
+    }
+  }
+  throw new Error(`Prompt não encontrado: ${relFromSrc}`);
+}
+
+function extractJsonFromText(raw: string): unknown {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  // remove fences ```json ... ```
+  const unfenced = s
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/```$/i, '')
+    .trim();
+  try {
+    return JSON.parse(unfenced);
+  } catch {
+    // tenta achar primeiro/último { } ou [ ]
+    const firstObj = unfenced.indexOf('{');
+    const lastObj = unfenced.lastIndexOf('}');
+    const firstArr = unfenced.indexOf('[');
+    const lastArr = unfenced.lastIndexOf(']');
+    const objSlice = firstObj >= 0 && lastObj > firstObj ? unfenced.slice(firstObj, lastObj + 1) : null;
+    const arrSlice = firstArr >= 0 && lastArr > firstArr ? unfenced.slice(firstArr, lastArr + 1) : null;
+    const candidate = arrSlice ?? objSlice;
+    if (!candidate) throw new Error('JSON inválido (não encontrado).');
+    return JSON.parse(candidate);
+  }
+}
+
+function extractOpenAIText(payload: any): string {
+  if (!payload) return '';
+  if (typeof payload.output_text === 'string') return payload.output_text;
+  // responses API: output -> content -> text
+  const out = payload.output;
+  if (Array.isArray(out)) {
+    const texts: string[] = [];
+    for (const item of out) {
+      const content = item?.content;
+      if (Array.isArray(content)) {
+        for (const c of content) {
+          const t = c?.text;
+          if (typeof t === 'string') texts.push(t);
+        }
+      }
+    }
+    if (texts.length) return texts.join('\n');
+  }
+  // fallback: message.content (chat completions style)
+  const msg = payload.choices?.[0]?.message?.content;
+  if (typeof msg === 'string') return msg;
+  return '';
+}
+
 async function getAuthCompanyGroupFilter(
   req: Request,
 ): Promise<{ companyId: number; groupId: number | null } | null> {
@@ -115,10 +191,10 @@ companiesRouter.get('/me/dashboard/filters', async (req: Request, res: Response)
              AND TRIM(fq.channel) <> ''
            ORDER BY value ASC`
         : `SELECT DISTINCT COALESCE(o.marketplace_name, o.channel) AS value
-           FROM orders o
-           JOIN companies c ON c.id = o.company_id
-           WHERE ${condSql} AND COALESCE(o.marketplace_name, o.channel) IS NOT NULL
-           ORDER BY value ASC`,
+       FROM orders o
+       JOIN companies c ON c.id = o.company_id
+       WHERE ${condSql} AND COALESCE(o.marketplace_name, o.channel) IS NOT NULL
+       ORDER BY value ASC`,
       [param],
     ),
     AppDataSource.query(
@@ -161,6 +237,12 @@ companiesRouter.get('/me/dashboard/filters', async (req: Request, res: Response)
 
 // Log de integrações (executados pelo script-bi/scheduler)
 companiesRouter.get('/me/integration-logs', async (req: Request, res: Response) => {
+  // Evita cache/ETag atrapalhando resultados em filtros e em diferentes companies/usuários
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  res.setHeader('Vary', 'Authorization, X-Company-Id');
+
   const userId = await getAuthUserId(req);
   if (!userId) return res.status(401).json({ message: 'Não autenticado' });
 
@@ -175,6 +257,12 @@ companiesRouter.get('/me/integration-logs', async (req: Request, res: Response) 
 
   const startDate = typeof q['start-date'] === 'string' ? String(q['start-date']).trim() : '';
   const endDate = typeof q['end-date'] === 'string' ? String(q['end-date']).trim() : '';
+  // Para "Data do Processamento", preferimos filtrar por DIA (sem hora) para evitar confusão de fuso.
+  // Aceita:
+  // - processed-date=YYYY-MM-DD (novo/mais simples)
+  // - processed-start / processed-end como YYYY-MM-DD (interpreta como range de datas)
+  // - processed-start / processed-end como timestamptz (mantém compatibilidade)
+  const processedDate = typeof q['processed-date'] === 'string' ? String(q['processed-date']).trim() : '';
   const processedStart = typeof q['processed-start'] === 'string' ? String(q['processed-start']).trim() : '';
   const processedEnd = typeof q['processed-end'] === 'string' ? String(q['processed-end']).trim() : '';
 
@@ -213,13 +301,34 @@ companiesRouter.get('/me/integration-logs', async (req: Request, res: Response) 
     where.push(`l.date <= $${params.length}::date`);
   }
 
-  if (processedStart) {
-    params.push(processedStart);
-    where.push(`l.processed_at >= $${params.length}::timestamptz`);
-  }
-  if (processedEnd) {
-    params.push(processedEnd);
-    where.push(`l.processed_at <= $${params.length}::timestamptz`);
+  const processedDateIsYmd = isIsoYmd(processedDate);
+  const processedStartIsYmd = isIsoYmd(processedStart);
+  const processedEndIsYmd = isIsoYmd(processedEnd);
+
+  if (processedDate && processedDateIsYmd) {
+    // Filtra por "dia local" do processamento
+    params.push(processedDate);
+    where.push(`(l.processed_at AT TIME ZONE 'America/Sao_Paulo')::date = $${params.length}::date`);
+  } else if ((processedStart && processedStartIsYmd) || (processedEnd && processedEndIsYmd)) {
+    // Range por dia (sem hora), evitando timezone drift.
+    if (processedStart && processedStartIsYmd) {
+      params.push(processedStart);
+      where.push(`(l.processed_at AT TIME ZONE 'America/Sao_Paulo')::date >= $${params.length}::date`);
+    }
+    if (processedEnd && processedEndIsYmd) {
+      params.push(processedEnd);
+      where.push(`(l.processed_at AT TIME ZONE 'America/Sao_Paulo')::date <= $${params.length}::date`);
+    }
+  } else {
+    // Compat: timestamptz range (ex.: 2026-01-19T00:00:00Z)
+    if (processedStart) {
+      params.push(processedStart);
+      where.push(`l.processed_at >= $${params.length}::timestamptz`);
+    }
+    if (processedEnd) {
+      params.push(processedEnd);
+      where.push(`l.processed_at <= $${params.length}::timestamptz`);
+    }
   }
 
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
@@ -346,6 +455,12 @@ companiesRouter.get('/me/dashboard/revenue', async (req: Request, res: Response)
   const filter = await getAuthCompanyGroupFilter(req);
   if (!filter) return res.status(400).json({ message: 'Company not configured for this user' });
 
+  const toStringArray = (v: any): string[] => {
+    if (!v) return [];
+    const raw = Array.isArray(v) ? v : [v];
+    return raw.map((x) => String(x).trim()).filter(Boolean);
+  };
+
   const start = String((req.query as any)?.start ?? '').trim();
   const end = String((req.query as any)?.end ?? '').trim();
   if (!isIsoYmd(start) || !isIsoYmd(end)) {
@@ -358,65 +473,170 @@ companiesRouter.get('/me/dashboard/revenue', async (req: Request, res: Response)
 
   const condSqlFq = groupId ? 'c.group_id = $1' : 'fq.company_id = $1';
 
+  const statuses = toStringArray((req.query as any)?.status).map((s) => s.toLowerCase());
+  const channels = toStringArray((req.query as any)?.channel);
+  const categories = toStringArray((req.query as any)?.category);
+  const states = toStringArray((req.query as any)?.state).map((s) => s.toUpperCase());
+  const cities = toStringArray((req.query as any)?.city);
+  const skus = Array.from(
+    new Set([...toStringArray((req.query as any)?.sku), ...toStringArray((req.query as any)?.product)].map((s) => String(s).trim()).filter(Boolean)),
+  );
+  const companyIds = Array.from(
+    new Set([...toStringArray((req.query as any)?.company_id), ...toStringArray((req.query as any)?.store)])
+  )
+    .map((s) => Number(s))
+    .filter((n) => Number.isInteger(n) && n > 0);
+
+  // Drilldown de categoria (aplica somente no agregado byCategory deste endpoint)
+  type CategoryDrillLevel = 'category' | 'subcategory' | 'final';
+  const categoryLevelRaw = String((req.query as any)?.category_level ?? 'category')
+    .trim()
+    .toLowerCase();
+  const categoryLevel: CategoryDrillLevel =
+    categoryLevelRaw === 'subcategory' ? 'subcategory' : categoryLevelRaw === 'final' ? 'final' : 'category';
+  const drillCategory = String((req.query as any)?.drill_category ?? '').trim();
+  const drillSubcategory = String((req.query as any)?.drill_subcategory ?? '').trim();
+  const categoryExpr =
+    categoryLevel === 'category' ? 'p.category' : categoryLevel === 'subcategory' ? 'p.subcategory' : 'p.final_category';
+  const categoryEmptyLabel =
+    categoryLevel === 'category' ? '(sem categoria)' : categoryLevel === 'subcategory' ? '(sem subcategoria)' : '(sem categoria final)';
+  const categoryIdExpr = `COALESCE(NULLIF(TRIM(${categoryExpr}), ''), '${categoryEmptyLabel}')`;
+  const drillCategoryExpr = `COALESCE(NULLIF(TRIM(p.category), ''), '(sem categoria)')`;
+  const drillSubcategoryExpr = `COALESCE(NULLIF(TRIM(p.subcategory), ''), '(sem subcategoria)')`;
+  const drillCategoryParam = categoryLevel === 'category' ? null : drillCategory || null;
+  const drillSubcategoryParam = categoryLevel === 'final' ? drillSubcategory || null : null;
+
+  // regra: se filtrar por categoria/SKU, o faturamento deve vir do item (unit_price * quantity)
+  const useItemsRevenue = Boolean(categories.length || skus.length);
+
   // regra de "faturamento" usada no resto do dashboard: total_amount - total_discount + shipping_amount
-  const revenueExpr = `
-    (COALESCE(o.total_amount, 0)::numeric
-     - COALESCE(o.total_discount, 0)::numeric
-     + COALESCE(o.shipping_amount, 0)::numeric)
-  `;
+  const revenueExpr = useItemsRevenue
+    ? `COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric`
+    : `
+      COALESCE(SUM(
+        (COALESCE(o.total_amount, 0)::numeric
+         - COALESCE(o.total_discount, 0)::numeric
+         + COALESCE(o.shipping_amount, 0)::numeric)
+      ), 0)::numeric
+    `;
 
   const growthOffsets = [1, 7, 14, 21, 28];
+
+  const commonWhere: string[] = [`${condSql}`, `o.order_date IS NOT NULL`];
+  const commonParams: any[] = [param];
+
+  if (groupId && companyIds.length) {
+    commonParams.push(companyIds);
+    commonWhere.push(`o.company_id = ANY($${commonParams.length}::int[])`);
+  }
+  if (channels.length) {
+    commonParams.push(channels);
+    commonWhere.push(`COALESCE(o.marketplace_name, o.channel) = ANY($${commonParams.length}::text[])`);
+  }
+  if (states.length) {
+    commonParams.push(states);
+    commonWhere.push(`UPPER(TRIM(o.delivery_state)) = ANY($${commonParams.length}::text[])`);
+  }
+  if (cities.length) {
+    commonParams.push(cities);
+    commonWhere.push(`o.delivery_city = ANY($${commonParams.length}::text[])`);
+  }
+  if (statuses.length) {
+    commonParams.push(statuses);
+    commonWhere.push(`LOWER(TRIM(COALESCE(o.current_status, ''))) = ANY($${commonParams.length}::text[])`);
+  }
+
+  const baseJoinSql = useItemsRevenue
+    ? `JOIN order_items i ON i.order_id = o.id
+       JOIN products p ON p.id = i.product_id`
+    : ``;
+
+  const filterSqlExtra = useItemsRevenue
+    ? `
+      AND (CASE WHEN $${commonParams.length + 1}::text[] IS NULL OR array_length($${commonParams.length + 1}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${commonParams.length + 1}::text[]) END)
+      AND (CASE WHEN $${commonParams.length + 2}::text[] IS NULL OR array_length($${commonParams.length + 2}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${commonParams.length + 2}::text[]) END)
+    `
+    : ``;
+  const filterParamsExtra = useItemsRevenue ? [categories.length ? categories : null, skus.length ? skus : null] : [];
 
   const [
     todayRows,
     periodRows,
     dailyRows,
     ordersCountRows,
+    itemsSoldRows,
     quotesCountRows,
     uniqueCustomersRows,
     byMarketplaceRows,
+    byProductRows,
+    byBrandRows,
+    byCategoryAggRows,
     ...growthRowsList
   ] = await Promise.all([
     AppDataSource.query(
-      `SELECT COALESCE(SUM(${revenueExpr}), 0) AS total
+      `SELECT ${revenueExpr} AS total
        FROM orders o
        JOIN companies c ON c.id = o.company_id
-       WHERE ${condSql}
-         AND o.order_date IS NOT NULL
-         AND o.order_date::date = ((now() AT TIME ZONE 'America/Sao_Paulo')::date)`,
-      [param],
+       ${baseJoinSql}
+       WHERE ${commonWhere.join(' AND ')}
+         AND o.order_date::date = ((now() AT TIME ZONE 'America/Sao_Paulo')::date)
+       ${filterSqlExtra}`,
+      [...commonParams, ...filterParamsExtra],
     ),
     AppDataSource.query(
-      `SELECT COALESCE(SUM(${revenueExpr}), 0) AS total
+      `SELECT ${revenueExpr} AS total
        FROM orders o
        JOIN companies c ON c.id = o.company_id
-       WHERE ${condSql}
-         AND o.order_date IS NOT NULL
-         AND o.order_date::date BETWEEN $2::date AND $3::date`,
-      [param, start, end],
+       ${baseJoinSql}
+       WHERE ${commonWhere.join(' AND ')}
+         AND o.order_date::date BETWEEN $${commonParams.length + 1}::date AND $${commonParams.length + 2}::date
+       ${filterSqlExtra}`,
+      [...commonParams, start, end, ...filterParamsExtra],
     ),
     AppDataSource.query(
       `SELECT
          o.order_date::date AS day_date,
+         to_char(o.order_date::date, 'YYYY-MM-DD') AS ymd,
          to_char(o.order_date::date, 'DD/MM/YYYY') AS day,
-         COALESCE(SUM(${revenueExpr}), 0) AS total
+         ${revenueExpr} AS total
        FROM orders o
        JOIN companies c ON c.id = o.company_id
-       WHERE ${condSql}
-         AND o.order_date IS NOT NULL
-         AND o.order_date::date BETWEEN $2::date AND $3::date
-       GROUP BY 1, 2
+       ${baseJoinSql}
+       WHERE ${commonWhere.join(' AND ')}
+         AND o.order_date::date BETWEEN $${commonParams.length + 1}::date AND $${commonParams.length + 2}::date
+       ${filterSqlExtra}
+       GROUP BY 1, 2, 3
        ORDER BY 1 ASC`,
-      [param, start, end],
+      [...commonParams, start, end, ...filterParamsExtra],
     ),
     AppDataSource.query(
-      `SELECT COUNT(*) AS total
+      `SELECT COUNT(DISTINCT o.id) AS total
        FROM orders o
        JOIN companies c ON c.id = o.company_id
-       WHERE ${condSql}
-         AND o.order_date IS NOT NULL
-         AND o.order_date::date BETWEEN $2::date AND $3::date`,
-      [param, start, end],
+       ${baseJoinSql}
+       WHERE ${commonWhere.join(' AND ')}
+         AND o.order_date::date BETWEEN $${commonParams.length + 1}::date AND $${commonParams.length + 2}::date
+       ${filterSqlExtra}`,
+      [...commonParams, start, end, ...filterParamsExtra],
+    ),
+    AppDataSource.query(
+      `SELECT COALESCE(SUM(i.quantity::int), 0)::int AS total
+       FROM orders o
+       JOIN companies c ON c.id = o.company_id
+       JOIN order_items i ON i.order_id = o.id
+       ${useItemsRevenue ? `JOIN products p ON p.id = i.product_id` : ``}
+       WHERE ${commonWhere.join(' AND ')}
+         AND o.order_date::date BETWEEN $${commonParams.length + 1}::date AND $${commonParams.length + 2}::date
+         ${
+           useItemsRevenue
+             ? `
+           AND (CASE WHEN $${commonParams.length + 3}::text[] IS NULL OR array_length($${commonParams.length + 3}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${commonParams.length + 3}::text[]) END)
+           AND (CASE WHEN $${commonParams.length + 4}::text[] IS NULL OR array_length($${commonParams.length + 4}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${commonParams.length + 4}::text[]) END)
+         `
+             : ``
+         }
+      `,
+      [...commonParams, start, end, ...(useItemsRevenue ? [categories.length ? categories : null, skus.length ? skus : null] : [])],
     ),
     AppDataSource.query(
       `SELECT COUNT(*) AS total
@@ -424,42 +644,112 @@ companiesRouter.get('/me/dashboard/revenue', async (req: Request, res: Response)
        JOIN companies c ON c.id = fq.company_id
        WHERE ${condSqlFq}
          AND fq.quoted_at IS NOT NULL
-         AND fq.quoted_at::date BETWEEN $2::date AND $3::date`,
-      [param, start, end],
+         AND fq.quoted_at::date BETWEEN $2::date AND $3::date
+         ${groupId && companyIds.length ? `AND fq.company_id = ANY($4::int[])` : ``}
+         ${channels.length ? `AND UPPER(TRIM(fq.channel)) = ANY($${groupId && companyIds.length ? 5 : 4}::text[])` : ``}
+      `,
+      [param, start, end, ...(groupId && companyIds.length ? [companyIds] : []), ...(channels.length ? [channels.map((c) => String(c).toUpperCase().trim()).filter(Boolean)] : [])],
     ),
     AppDataSource.query(
       `SELECT COUNT(DISTINCT o.customer_id) AS total
        FROM orders o
        JOIN companies c ON c.id = o.company_id
-       WHERE ${condSql}
-         AND o.order_date IS NOT NULL
-         AND o.order_date::date BETWEEN $2::date AND $3::date
+       ${baseJoinSql}
+       WHERE ${commonWhere.join(' AND ')}
+         AND o.order_date::date BETWEEN $${commonParams.length + 1}::date AND $${commonParams.length + 2}::date
          AND o.customer_id IS NOT NULL`,
-      [param, start, end],
+      [...commonParams, start, end, ...filterParamsExtra],
     ),
     AppDataSource.query(
       `SELECT
          COALESCE(NULLIF(TRIM(COALESCE(o.marketplace_name, o.channel)), ''), 'Sem canal') AS marketplace,
-         COUNT(*)::int AS orders_count,
-         COALESCE(SUM(${revenueExpr}), 0) AS revenue
+         COUNT(DISTINCT o.id)::int AS orders_count,
+         ${revenueExpr} AS revenue
        FROM orders o
        JOIN companies c ON c.id = o.company_id
-       WHERE ${condSql}
-         AND o.order_date IS NOT NULL
-         AND o.order_date::date BETWEEN $2::date AND $3::date
+       ${baseJoinSql}
+       WHERE ${commonWhere.join(' AND ')}
+         AND o.order_date::date BETWEEN $${commonParams.length + 1}::date AND $${commonParams.length + 2}::date
+       ${filterSqlExtra}
        GROUP BY 1
        ORDER BY revenue DESC, marketplace ASC`,
-      [param, start, end],
+      [...commonParams, start, end, ...filterParamsExtra],
+    ),
+    // Lista de SKUs vendidos (sempre via itens para atribuir faturamento ao produto)
+    AppDataSource.query(
+      `
+      SELECT
+        p.id AS product_id,
+        p.sku AS sku,
+        MAX(p.name) AS name,
+        COUNT(DISTINCT o.id)::int AS orders_count,
+        COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric AS revenue,
+        COALESCE(SUM(i.quantity::int), 0)::int AS qty
+      FROM orders o
+      JOIN companies c ON c.id = o.company_id
+      JOIN order_items i ON i.order_id = o.id
+      JOIN products p ON p.id = i.product_id
+      WHERE ${commonWhere.join(' AND ')}
+        AND o.order_date::date BETWEEN $${commonParams.length + 1}::date AND $${commonParams.length + 2}::date
+        AND (CASE WHEN $${commonParams.length + 3}::text[] IS NULL OR array_length($${commonParams.length + 3}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${commonParams.length + 3}::text[]) END)
+        AND (CASE WHEN $${commonParams.length + 4}::text[] IS NULL OR array_length($${commonParams.length + 4}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${commonParams.length + 4}::text[]) END)
+      GROUP BY 1, 2
+      ORDER BY revenue DESC NULLS LAST
+      LIMIT 100
+      `,
+      [...commonParams, start, end, categories.length ? categories : null, skus.length ? skus : null],
+    ),
+    // Breakdown por marca/categoria: sempre via itens (para atribuir faturamento corretamente)
+    AppDataSource.query(
+      `
+      SELECT
+        COALESCE(NULLIF(TRIM(p.brand), ''), '(sem marca)') AS id,
+        COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric AS revenue
+      FROM orders o
+      JOIN companies c ON c.id = o.company_id
+      JOIN order_items i ON i.order_id = o.id
+      JOIN products p ON p.id = i.product_id
+      WHERE ${commonWhere.join(' AND ')}
+        AND o.order_date::date BETWEEN $${commonParams.length + 1}::date AND $${commonParams.length + 2}::date
+        AND (CASE WHEN $${commonParams.length + 3}::text[] IS NULL OR array_length($${commonParams.length + 3}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${commonParams.length + 3}::text[]) END)
+        AND (CASE WHEN $${commonParams.length + 4}::text[] IS NULL OR array_length($${commonParams.length + 4}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${commonParams.length + 4}::text[]) END)
+      GROUP BY 1
+      ORDER BY revenue DESC NULLS LAST, id ASC
+      LIMIT 12
+      `,
+      [...commonParams, start, end, categories.length ? categories : null, skus.length ? skus : null],
+    ),
+    AppDataSource.query(
+      `
+      SELECT
+        ${categoryIdExpr} AS id,
+        COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric AS revenue
+      FROM orders o
+      JOIN companies c ON c.id = o.company_id
+      JOIN order_items i ON i.order_id = o.id
+      JOIN products p ON p.id = i.product_id
+      WHERE ${commonWhere.join(' AND ')}
+        AND o.order_date::date BETWEEN $${commonParams.length + 1}::date AND $${commonParams.length + 2}::date
+        AND (CASE WHEN $${commonParams.length + 3}::text[] IS NULL OR array_length($${commonParams.length + 3}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${commonParams.length + 3}::text[]) END)
+        AND (CASE WHEN $${commonParams.length + 4}::text[] IS NULL OR array_length($${commonParams.length + 4}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${commonParams.length + 4}::text[]) END)
+        AND (CASE WHEN $${commonParams.length + 5}::text IS NULL OR $${commonParams.length + 5}::text = '' THEN TRUE ELSE ${drillCategoryExpr} = $${commonParams.length + 5}::text END)
+        AND (CASE WHEN $${commonParams.length + 6}::text IS NULL OR $${commonParams.length + 6}::text = '' THEN TRUE ELSE ${drillSubcategoryExpr} = $${commonParams.length + 6}::text END)
+      GROUP BY 1
+      ORDER BY revenue DESC NULLS LAST, id ASC
+      LIMIT 12
+      `,
+      [...commonParams, start, end, categories.length ? categories : null, skus.length ? skus : null, drillCategoryParam, drillSubcategoryParam],
     ),
     ...growthOffsets.map((offsetDays) =>
       AppDataSource.query(
-        `SELECT COALESCE(SUM(${revenueExpr}), 0) AS total
+        `SELECT ${revenueExpr} AS total
          FROM orders o
          JOIN companies c ON c.id = o.company_id
-         WHERE ${condSql}
-           AND o.order_date IS NOT NULL
-           AND o.order_date::date BETWEEN ($2::date - $4::int) AND ($3::date - $4::int)`,
-        [param, start, end, offsetDays],
+         ${baseJoinSql}
+         WHERE ${commonWhere.join(' AND ')}
+           AND o.order_date::date BETWEEN ($${commonParams.length + 1}::date - $${commonParams.length + 3}::int) AND ($${commonParams.length + 2}::date - $${commonParams.length + 3}::int)
+         ${filterSqlExtra}`,
+        [...commonParams, start, end, offsetDays, ...filterParamsExtra],
       ),
     ),
   ]);
@@ -467,10 +757,12 @@ companiesRouter.get('/me/dashboard/revenue', async (req: Request, res: Response)
   const todayTotal = Number((todayRows?.[0] as any)?.total ?? 0) || 0;
   const periodTotal = Number((periodRows?.[0] as any)?.total ?? 0) || 0;
   const ordersCount = Number((ordersCountRows?.[0] as any)?.total ?? 0) || 0;
+  const itemsSold = Number((itemsSoldRows?.[0] as any)?.total ?? 0) || 0;
   const quotesCount = Number((quotesCountRows?.[0] as any)?.total ?? 0) || 0;
   const uniqueCustomers = Number((uniqueCustomersRows?.[0] as any)?.total ?? 0) || 0;
   const conversionRate = quotesCount > 0 ? ordersCount / quotesCount : 0;
   const daily = (dailyRows || []).map((r: any) => ({
+    ymd: String(r.ymd || ''), // YYYY-MM-DD
     date: String(r.day), // DD/MM/YYYY (para o gráfico)
     total: Number(r.total ?? 0) || 0,
   }));
@@ -482,6 +774,22 @@ companiesRouter.get('/me/dashboard/revenue', async (req: Request, res: Response)
     const ordersCount = Number(r.orders_count ?? 0) || 0;
     return {
       marketplace: String(r.marketplace || 'Sem canal'),
+      revenue,
+      ordersCount,
+      avgTicket: ordersCount > 0 ? revenue / ordersCount : 0,
+    };
+  });
+
+  const byBrand = (byBrandRows || []).map((r: any) => ({ id: String(r.id), revenue: Number(r.revenue ?? 0) || 0 }));
+  const byCategoryAgg = (byCategoryAggRows || []).map((r: any) => ({ id: String(r.id), revenue: Number(r.revenue ?? 0) || 0 }));
+  const byProductTable = (byProductRows || []).map((r: any) => {
+    const revenue = Number(r.revenue ?? 0) || 0;
+    const ordersCount = Number(r.orders_count ?? 0) || 0;
+    return {
+      productId: Number(r.product_id ?? 0) || null,
+      sku: String(r.sku ?? ''),
+      name: r.name ?? null,
+      qty: Number(r.qty ?? 0) || 0,
       revenue,
       ordersCount,
       avgTicket: ordersCount > 0 ? revenue / ordersCount : 0,
@@ -502,12 +810,16 @@ companiesRouter.get('/me/dashboard/revenue', async (req: Request, res: Response)
     today: todayTotal,
     period: periodTotal,
     ordersCount,
+    itemsSold,
     quotesCount,
     conversionRate,
     uniqueCustomers,
     avgTicket,
     growth,
     byMarketplace,
+    byProductTable,
+    byBrand,
+    byCategory: byCategoryAgg,
     daily,
   });
 });
@@ -537,6 +849,25 @@ companiesRouter.get('/me/dashboard/live/overview', async (req: Request, res: Res
   const companyIds = toStringArray((req.query as any)?.company_id)
     .map((s) => Number(s))
     .filter((n) => Number.isInteger(n) && n > 0);
+
+  // Drilldown de categoria (aplica somente nos agregados de categoria)
+  type CategoryDrillLevel = 'category' | 'subcategory' | 'final';
+  const categoryLevelRaw = String((req.query as any)?.category_level ?? 'category')
+    .trim()
+    .toLowerCase();
+  const categoryLevel: CategoryDrillLevel =
+    categoryLevelRaw === 'subcategory' ? 'subcategory' : categoryLevelRaw === 'final' ? 'final' : 'category';
+  const drillCategory = String((req.query as any)?.drill_category ?? '').trim();
+  const drillSubcategory = String((req.query as any)?.drill_subcategory ?? '').trim();
+  const categoryExpr =
+    categoryLevel === 'category' ? 'p.category' : categoryLevel === 'subcategory' ? 'p.subcategory' : 'p.final_category';
+  const categoryEmptyLabel =
+    categoryLevel === 'category' ? '(sem categoria)' : categoryLevel === 'subcategory' ? '(sem subcategoria)' : '(sem categoria final)';
+  const categoryIdExpr = `COALESCE(NULLIF(TRIM(${categoryExpr}), ''), '${categoryEmptyLabel}')`;
+  const drillCategoryExpr = `COALESCE(NULLIF(TRIM(p.category), ''), '(sem categoria)')`;
+  const drillSubcategoryExpr = `COALESCE(NULLIF(TRIM(p.subcategory), ''), '(sem subcategoria)')`;
+  const drillCategoryParam = categoryLevel === 'category' ? null : drillCategory || null;
+  const drillSubcategoryParam = categoryLevel === 'final' ? drillSubcategory || null : null;
 
   // regra: se filtrar por categoria/SKU, o faturamento deve vir do item (unit_price * quantity)
   const useItemsRevenue = Boolean(categories.length || skus.length);
@@ -898,7 +1229,7 @@ companiesRouter.get('/me/dashboard/live/overview', async (req: Request, res: Res
     const byCategory = await AppDataSource.query(
       `
       SELECT
-        COALESCE(NULLIF(TRIM(COALESCE(p.final_category, p.category)), ''), '(sem categoria)') AS id,
+        ${categoryIdExpr} AS id,
         COUNT(DISTINCT o.id)::int AS orders_count,
         COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric AS value
       FROM orders o
@@ -908,10 +1239,12 @@ companiesRouter.get('/me/dashboard/live/overview', async (req: Request, res: Res
       WHERE ${whereToday.join(' AND ')}
         AND (CASE WHEN $${dayParamsBase.length + 1}::text[] IS NULL OR array_length($${dayParamsBase.length + 1}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${dayParamsBase.length + 1}::text[]) END)
         AND (CASE WHEN $${dayParamsBase.length + 2}::text[] IS NULL OR array_length($${dayParamsBase.length + 2}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${dayParamsBase.length + 2}::text[]) END)
+        AND (CASE WHEN $${dayParamsBase.length + 3}::text IS NULL OR $${dayParamsBase.length + 3}::text = '' THEN TRUE ELSE ${drillCategoryExpr} = $${dayParamsBase.length + 3}::text END)
+        AND (CASE WHEN $${dayParamsBase.length + 4}::text IS NULL OR $${dayParamsBase.length + 4}::text = '' THEN TRUE ELSE ${drillSubcategoryExpr} = $${dayParamsBase.length + 4}::text END)
       GROUP BY 1
       ORDER BY value DESC, id ASC
       `,
-      [...dayParamsBase, categories.length ? categories : null, skus.length ? skus : null],
+      [...dayParamsBase, categories.length ? categories : null, skus.length ? skus : null, drillCategoryParam, drillSubcategoryParam],
     );
 
     const toStateTable = (rows: any[]) =>
@@ -1008,7 +1341,7 @@ companiesRouter.get('/me/dashboard/live/overview', async (req: Request, res: Res
       const rows = await AppDataSource.query(
         `
           SELECT
-            COALESCE(NULLIF(TRIM(COALESCE(p.final_category, p.category)), ''), '(sem categoria)') AS id,
+            ${categoryIdExpr} AS id,
             COUNT(DISTINCT o.id)::int AS orders_count,
             COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric AS value
           FROM orders o
@@ -1018,10 +1351,12 @@ companiesRouter.get('/me/dashboard/live/overview', async (req: Request, res: Res
           WHERE ${whereDay.join(' AND ')}
             AND (CASE WHEN $${dayParams.length + 1}::text[] IS NULL OR array_length($${dayParams.length + 1}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${dayParams.length + 1}::text[]) END)
             AND (CASE WHEN $${dayParams.length + 2}::text[] IS NULL OR array_length($${dayParams.length + 2}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${dayParams.length + 2}::text[]) END)
+            AND (CASE WHEN $${dayParams.length + 3}::text IS NULL OR $${dayParams.length + 3}::text = '' THEN TRUE ELSE ${drillCategoryExpr} = $${dayParams.length + 3}::text END)
+            AND (CASE WHEN $${dayParams.length + 4}::text IS NULL OR $${dayParams.length + 4}::text = '' THEN TRUE ELSE ${drillSubcategoryExpr} = $${dayParams.length + 4}::text END)
           GROUP BY 1
           ORDER BY value DESC, id ASC
         `,
-        [...dayParams, categories.length ? categories : null, skus.length ? skus : null],
+        [...dayParams, categories.length ? categories : null, skus.length ? skus : null, drillCategoryParam, drillSubcategoryParam],
       );
       return toCategoryTable(rows);
     };
@@ -1268,6 +1603,1086 @@ companiesRouter.get('/me/dashboard/live/overview', async (req: Request, res: Res
     });
   } catch (err: any) {
     return res.status(500).json({ message: err?.message || 'Erro ao carregar Ao Vivo' });
+  }
+});
+
+companiesRouter.get('/me/dashboard/operation/summary', async (req: Request, res: Response) => {
+  const userId = await getAuthUserId(req);
+  if (!userId) return res.status(401).json({ message: 'Não autenticado' });
+
+  const filter = await getAuthCompanyGroupFilter(req);
+  if (!filter) return res.status(400).json({ message: 'Company not configured for this user' });
+
+  const start = String((req.query as any)?.start ?? '').trim();
+  const end = String((req.query as any)?.end ?? '').trim();
+  if (!isIsoYmd(start) || !isIsoYmd(end)) {
+    return res.status(400).json({ message: 'Parâmetros inválidos: start/end devem estar em YYYY-MM-DD.' });
+  }
+
+  const toStringArray = (v: any): string[] => {
+    if (!v) return [];
+    const raw = Array.isArray(v) ? v : [v];
+    return raw.map((x) => String(x).trim()).filter(Boolean);
+  };
+
+  const { companyId, groupId } = filter;
+  const condSql = groupId ? 'c.group_id = $1' : 'o.company_id = $1';
+  const param = groupId ?? companyId;
+
+  const channels = toStringArray((req.query as any)?.channel);
+  const categories = toStringArray((req.query as any)?.category);
+  const states = toStringArray((req.query as any)?.state).map((s) => s.toUpperCase());
+  const cities = toStringArray((req.query as any)?.city);
+  const skus = Array.from(
+    new Set([...toStringArray((req.query as any)?.sku), ...toStringArray((req.query as any)?.product)].map((s) => String(s).trim()).filter(Boolean)),
+  );
+  const companyIds = Array.from(new Set([...toStringArray((req.query as any)?.company_id), ...toStringArray((req.query as any)?.store)]))
+    .map((s) => Number(s))
+    .filter((n) => Number.isInteger(n) && n > 0);
+
+  // Para a Operação, as métricas são por status (cancelado/devolvido/andamento),
+  // então NÃO aplicamos o filtro "status" do usuário aqui.
+  const useItemsFilter = Boolean(categories.length || skus.length);
+
+  const where: string[] = [`${condSql}`, `o.order_date IS NOT NULL`, `o.order_date::date BETWEEN $2::date AND $3::date`];
+  const params: any[] = [param, start, end];
+
+  if (groupId && companyIds.length) {
+    params.push(companyIds);
+    where.push(`o.company_id = ANY($${params.length}::int[])`);
+  }
+  if (channels.length) {
+    params.push(channels);
+    where.push(`COALESCE(o.marketplace_name, o.channel) = ANY($${params.length}::text[])`);
+  }
+  if (states.length) {
+    params.push(states);
+    where.push(`UPPER(TRIM(o.delivery_state)) = ANY($${params.length}::text[])`);
+  }
+  if (cities.length) {
+    params.push(cities);
+    where.push(`o.delivery_city = ANY($${params.length}::text[])`);
+  }
+
+  const statusExpr = `LOWER(TRIM(COALESCE(o.current_status, '')))`;
+  const doneStatuses = ['entregue', 'devolvido', 'cancelado', 'bloqueado'];
+
+  const rows = await AppDataSource.query(
+    useItemsFilter
+      ? `
+      WITH base AS (
+        SELECT DISTINCT o.id, ${statusExpr} AS st
+        FROM orders o
+        JOIN companies c ON c.id = o.company_id
+        JOIN order_items i ON i.order_id = o.id
+        JOIN products p ON p.id = i.product_id
+        WHERE ${where.join(' AND ')}
+          AND (CASE WHEN $${params.length + 1}::text[] IS NULL OR array_length($${params.length + 1}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${params.length + 1}::text[]) END)
+          AND (CASE WHEN $${params.length + 2}::text[] IS NULL OR array_length($${params.length + 2}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${params.length + 2}::text[]) END)
+      )
+      SELECT
+        COALESCE(SUM(CASE WHEN st = 'cancelado' THEN 1 ELSE 0 END), 0)::int AS cancelled,
+        COALESCE(SUM(CASE WHEN st = 'devolvido' THEN 1 ELSE 0 END), 0)::int AS returned,
+        COALESCE(SUM(CASE WHEN st = ANY($${params.length + 3}::text[]) THEN 0 ELSE 1 END), 0)::int AS in_progress
+      FROM base
+      `
+      : `
+      SELECT
+        COALESCE(SUM(CASE WHEN ${statusExpr} = 'cancelado' THEN 1 ELSE 0 END), 0)::int AS cancelled,
+        COALESCE(SUM(CASE WHEN ${statusExpr} = 'devolvido' THEN 1 ELSE 0 END), 0)::int AS returned,
+        COALESCE(SUM(CASE WHEN ${statusExpr} = ANY($${params.length + 1}::text[]) THEN 0 ELSE 1 END), 0)::int AS in_progress
+      FROM orders o
+      JOIN companies c ON c.id = o.company_id
+      WHERE ${where.join(' AND ')}
+      `,
+    useItemsFilter
+      ? [...params, categories.length ? categories : null, skus.length ? skus : null, doneStatuses]
+      : [...params, doneStatuses],
+  );
+
+  const r0 = rows?.[0] || {};
+  return res.json({
+    start,
+    end,
+    cancelled: Number(r0.cancelled ?? 0) || 0,
+    returned: Number(r0.returned ?? 0) || 0,
+    inProgress: Number(r0.in_progress ?? 0) || 0,
+  });
+});
+
+companiesRouter.get('/me/dashboard/operation/marketplace-table', async (req: Request, res: Response) => {
+  const userId = await getAuthUserId(req);
+  if (!userId) return res.status(401).json({ message: 'Não autenticado' });
+
+  const filter = await getAuthCompanyGroupFilter(req);
+  if (!filter) return res.status(400).json({ message: 'Company not configured for this user' });
+
+  const start = String((req.query as any)?.start ?? '').trim();
+  const end = String((req.query as any)?.end ?? '').trim();
+  if (!isIsoYmd(start) || !isIsoYmd(end)) {
+    return res.status(400).json({ message: 'Parâmetros inválidos: start/end devem estar em YYYY-MM-DD.' });
+  }
+
+  const toStringArray = (v: any): string[] => {
+    if (!v) return [];
+    const raw = Array.isArray(v) ? v : [v];
+    return raw.map((x) => String(x).trim()).filter(Boolean);
+  };
+
+  const { companyId, groupId } = filter;
+  const condSql = groupId ? 'c.group_id = $1' : 'o.company_id = $1';
+  const param = groupId ?? companyId;
+
+  const channels = toStringArray((req.query as any)?.channel);
+  const statuses = toStringArray((req.query as any)?.status).map((s) => s.toLowerCase());
+  const categories = toStringArray((req.query as any)?.category);
+  const states = toStringArray((req.query as any)?.state).map((s) => s.toUpperCase());
+  const cities = toStringArray((req.query as any)?.city);
+  const skus = Array.from(
+    new Set([...toStringArray((req.query as any)?.sku), ...toStringArray((req.query as any)?.product)].map((s) => String(s).trim()).filter(Boolean)),
+  );
+  const companyIds = Array.from(new Set([...toStringArray((req.query as any)?.company_id), ...toStringArray((req.query as any)?.store)]))
+    .map((s) => Number(s))
+    .filter((n) => Number.isInteger(n) && n > 0);
+
+  // Regras
+  const toInvoiceStatuses = ['novo', 'aguardando pagamento', 'pendente', 'em analise', 'aprovado']; // "antes de faturar"
+  const inTransitStatuses = ['coletando', 'aguardando disponibilidade', 'em transporte', 'entregue marketplace'];
+  const cancelBucketStatuses = ['devolvido', 'cancelado', 'frete não atendido', 'desmembrado', 'bloqueado'];
+
+  // Para esse detalhamento, filtros por categoria/SKU precisam olhar itens.
+  const useItemsFilter = Boolean(categories.length || skus.length);
+
+  const where: string[] = [
+    `${condSql}`,
+    `o.order_date IS NOT NULL`,
+    `o.order_date::date BETWEEN $2::date AND $3::date`,
+  ];
+  const params: any[] = [param, start, end];
+
+  if (groupId && companyIds.length) {
+    params.push(companyIds);
+    where.push(`o.company_id = ANY($${params.length}::int[])`);
+  }
+  if (channels.length) {
+    params.push(channels);
+    where.push(`COALESCE(o.marketplace_name, o.channel) = ANY($${params.length}::text[])`);
+  }
+  if (states.length) {
+    params.push(states);
+    where.push(`UPPER(TRIM(o.delivery_state)) = ANY($${params.length}::text[])`);
+  }
+  if (cities.length) {
+    params.push(cities);
+    where.push(`o.delivery_city = ANY($${params.length}::text[])`);
+  }
+  if (statuses.length) {
+    params.push(statuses);
+    where.push(`LOWER(TRIM(COALESCE(o.current_status, ''))) = ANY($${params.length}::text[])`);
+  }
+
+  const mpExpr = `COALESCE(NULLIF(TRIM(COALESCE(o.marketplace_name, o.channel)), ''), '(sem marketplace)')`;
+  const statusExpr = `LOWER(TRIM(COALESCE(o.current_status, '')))`;
+
+  const rows = await AppDataSource.query(
+    useItemsFilter
+      ? `
+      WITH meta AS (
+        SELECT
+          (now() AT TIME ZONE 'America/Sao_Paulo')::date AS today,
+          ((now() AT TIME ZONE 'America/Sao_Paulo')::date - 1)::date AS yesterday,
+          ((now() AT TIME ZONE 'America/Sao_Paulo')::date - 3)::date AS day_3
+      ),
+      base AS (
+        SELECT DISTINCT
+          o.id,
+          ${mpExpr} AS marketplace,
+          o.order_date::date AS order_day,
+          ${statusExpr} AS st
+        FROM orders o
+        JOIN companies c ON c.id = o.company_id
+        JOIN order_items i ON i.order_id = o.id
+        JOIN products p ON p.id = i.product_id
+        WHERE ${where.join(' AND ')}
+          AND (CASE WHEN $${params.length + 1}::text[] IS NULL OR array_length($${params.length + 1}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${params.length + 1}::text[]) END)
+          AND (CASE WHEN $${params.length + 2}::text[] IS NULL OR array_length($${params.length + 2}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${params.length + 2}::text[]) END)
+      )
+      SELECT
+        marketplace,
+        COUNT(*)::int AS total_orders,
+        COALESCE(SUM(CASE WHEN st = ANY($${params.length + 3}::text[]) THEN 1 ELSE 0 END), 0)::int AS to_invoice,
+        COALESCE(SUM(CASE WHEN st = ANY($${params.length + 3}::text[]) AND order_day = (SELECT today FROM meta) THEN 1 ELSE 0 END), 0)::int AS today_orders,
+        COALESCE(SUM(CASE WHEN st = ANY($${params.length + 3}::text[]) AND order_day = (SELECT yesterday FROM meta) THEN 1 ELSE 0 END), 0)::int AS yesterday_orders,
+        COALESCE(SUM(CASE WHEN st = ANY($${params.length + 3}::text[]) AND order_day <= (SELECT day_3 FROM meta) THEN 1 ELSE 0 END), 0)::int AS above_3_days,
+        COALESCE(SUM(CASE WHEN st = ANY($${params.length + 3}::text[]) THEN 1 ELSE 0 END), 0)::int AS kanban_new,
+        COALESCE(SUM(CASE WHEN st = 'faturando' OR st = 'aguardando transporte' THEN 1 ELSE 0 END), 0)::int AS kanban_invoiced,
+        COALESCE(SUM(CASE WHEN st = ANY($${params.length + 4}::text[]) THEN 1 ELSE 0 END), 0)::int AS kanban_in_transit,
+        COALESCE(SUM(CASE WHEN st = 'entregue' THEN 1 ELSE 0 END), 0)::int AS kanban_delivered,
+        COALESCE(SUM(CASE WHEN st = ANY($${params.length + 5}::text[]) THEN 1 ELSE 0 END), 0)::int AS kanban_cancelled,
+        COALESCE(SUM(CASE WHEN st = 'cancelado' THEN 1 ELSE 0 END), 0)::int AS cancelled,
+        COALESCE(SUM(CASE WHEN st = 'devolvido' THEN 1 ELSE 0 END), 0)::int AS returned
+      FROM base
+      GROUP BY 1
+      ORDER BY total_orders DESC, marketplace ASC
+      `
+      : `
+      WITH meta AS (
+        SELECT
+          (now() AT TIME ZONE 'America/Sao_Paulo')::date AS today,
+          ((now() AT TIME ZONE 'America/Sao_Paulo')::date - 1)::date AS yesterday,
+          ((now() AT TIME ZONE 'America/Sao_Paulo')::date - 3)::date AS day_3
+      )
+      SELECT
+        ${mpExpr} AS marketplace,
+        COUNT(DISTINCT o.id)::int AS total_orders,
+        COALESCE(SUM(CASE WHEN ${statusExpr} = ANY($${params.length + 1}::text[]) THEN 1 ELSE 0 END), 0)::int AS to_invoice,
+        COALESCE(SUM(CASE WHEN ${statusExpr} = ANY($${params.length + 1}::text[]) AND o.order_date::date = (SELECT today FROM meta) THEN 1 ELSE 0 END), 0)::int AS today_orders,
+        COALESCE(SUM(CASE WHEN ${statusExpr} = ANY($${params.length + 1}::text[]) AND o.order_date::date = (SELECT yesterday FROM meta) THEN 1 ELSE 0 END), 0)::int AS yesterday_orders,
+        COALESCE(SUM(CASE WHEN ${statusExpr} = ANY($${params.length + 1}::text[]) AND o.order_date::date <= (SELECT day_3 FROM meta) THEN 1 ELSE 0 END), 0)::int AS above_3_days,
+        COALESCE(SUM(CASE WHEN ${statusExpr} = ANY($${params.length + 1}::text[]) THEN 1 ELSE 0 END), 0)::int AS kanban_new,
+        COALESCE(SUM(CASE WHEN ${statusExpr} = 'faturando' OR ${statusExpr} = 'aguardando transporte' THEN 1 ELSE 0 END), 0)::int AS kanban_invoiced,
+        COALESCE(SUM(CASE WHEN ${statusExpr} = ANY($${params.length + 2}::text[]) THEN 1 ELSE 0 END), 0)::int AS kanban_in_transit,
+        COALESCE(SUM(CASE WHEN ${statusExpr} = 'entregue' THEN 1 ELSE 0 END), 0)::int AS kanban_delivered,
+        COALESCE(SUM(CASE WHEN ${statusExpr} = ANY($${params.length + 3}::text[]) THEN 1 ELSE 0 END), 0)::int AS kanban_cancelled,
+        COALESCE(SUM(CASE WHEN ${statusExpr} = 'cancelado' THEN 1 ELSE 0 END), 0)::int AS cancelled,
+        COALESCE(SUM(CASE WHEN ${statusExpr} = 'devolvido' THEN 1 ELSE 0 END), 0)::int AS returned
+      FROM orders o
+      JOIN companies c ON c.id = o.company_id
+      WHERE ${where.join(' AND ')}
+      GROUP BY 1
+      ORDER BY total_orders DESC, marketplace ASC
+      `,
+    useItemsFilter
+      ? [...params, categories.length ? categories : null, skus.length ? skus : null, toInvoiceStatuses, inTransitStatuses, cancelBucketStatuses]
+      : [...params, toInvoiceStatuses, inTransitStatuses, cancelBucketStatuses],
+  );
+
+  const outRows = (rows || []).map((r: any) => ({
+    marketplace: String(r.marketplace ?? ''),
+    totalOrders: Number(r.total_orders ?? 0) || 0,
+    toInvoice: Number(r.to_invoice ?? 0) || 0,
+    today: Number(r.today_orders ?? 0) || 0,
+    yesterday: Number(r.yesterday_orders ?? 0) || 0,
+    above3Days: Number(r.above_3_days ?? 0) || 0,
+    kanbanNew: Number(r.kanban_new ?? 0) || 0,
+    kanbanInvoiced: Number(r.kanban_invoiced ?? 0) || 0,
+    kanbanInTransit: Number(r.kanban_in_transit ?? 0) || 0,
+    kanbanDelivered: Number(r.kanban_delivered ?? 0) || 0,
+    kanbanCancelled: Number(r.kanban_cancelled ?? 0) || 0,
+    cancelled: Number(r.cancelled ?? 0) || 0,
+    returned: Number(r.returned ?? 0) || 0,
+  }));
+  const marketplaces = outRows.map((r: any) => String(r.marketplace));
+
+  return res.json({ start, end, marketplaces, rows: outRows });
+});
+
+companiesRouter.get('/me/dashboard/operation/kanban', async (req: Request, res: Response) => {
+  const userId = await getAuthUserId(req);
+  if (!userId) return res.status(401).json({ message: 'Não autenticado' });
+
+  const filter = await getAuthCompanyGroupFilter(req);
+  if (!filter) return res.status(400).json({ message: 'Company not configured for this user' });
+
+  const start = String((req.query as any)?.start ?? '').trim();
+  const end = String((req.query as any)?.end ?? '').trim();
+  if (!isIsoYmd(start) || !isIsoYmd(end)) {
+    return res.status(400).json({ message: 'Parâmetros inválidos: start/end devem estar em YYYY-MM-DD.' });
+  }
+
+  const limitRaw = Number((req.query as any)?.limit ?? 100);
+  const limit = Number.isInteger(limitRaw) ? Math.min(Math.max(limitRaw, 10), 500) : 100;
+
+  const toStringArray = (v: any): string[] => {
+    if (!v) return [];
+    const raw = Array.isArray(v) ? v : [v];
+    return raw.map((x) => String(x).trim()).filter(Boolean);
+  };
+
+  const { companyId, groupId } = filter;
+  const condSql = groupId ? 'c.group_id = $1' : 'o.company_id = $1';
+  const param = groupId ?? companyId;
+
+  const channels = toStringArray((req.query as any)?.channel);
+  const statuses = toStringArray((req.query as any)?.status).map((s) => s.toLowerCase());
+  const categories = toStringArray((req.query as any)?.category);
+  const states = toStringArray((req.query as any)?.state).map((s) => s.toUpperCase());
+  const cities = toStringArray((req.query as any)?.city);
+  const skus = Array.from(
+    new Set([...toStringArray((req.query as any)?.sku), ...toStringArray((req.query as any)?.product)].map((s) => String(s).trim()).filter(Boolean)),
+  );
+  const companyIds = Array.from(new Set([...toStringArray((req.query as any)?.company_id), ...toStringArray((req.query as any)?.store)]))
+    .map((s) => Number(s))
+    .filter((n) => Number.isInteger(n) && n > 0);
+
+  const novos = ['novo', 'aguardando pagamento', 'pendente', 'em analise', 'aprovado'];
+  const emTransporte = ['coletando', 'aguardando disponibilidade', 'em transporte', 'entregue marketplace'];
+  const cancelados = ['devolvido', 'cancelado', 'frete não atendido', 'desmembrado', 'bloqueado'];
+
+  const useItemsFilter = Boolean(categories.length || skus.length);
+
+  const where: string[] = [`${condSql}`, `o.order_date IS NOT NULL`, `o.order_date::date BETWEEN $2::date AND $3::date`];
+  const params: any[] = [param, start, end];
+
+  if (groupId && companyIds.length) {
+    params.push(companyIds);
+    where.push(`o.company_id = ANY($${params.length}::int[])`);
+  }
+  if (channels.length) {
+    params.push(channels);
+    where.push(`COALESCE(o.marketplace_name, o.channel) = ANY($${params.length}::text[])`);
+  }
+  if (states.length) {
+    params.push(states);
+    where.push(`UPPER(TRIM(o.delivery_state)) = ANY($${params.length}::text[])`);
+  }
+  if (cities.length) {
+    params.push(cities);
+    where.push(`o.delivery_city = ANY($${params.length}::text[])`);
+  }
+  if (statuses.length) {
+    params.push(statuses);
+    where.push(`LOWER(TRIM(COALESCE(o.current_status, ''))) = ANY($${params.length}::text[])`);
+  }
+
+  const mpExpr = `COALESCE(NULLIF(TRIM(COALESCE(o.marketplace_name, o.channel)), ''), '(sem marketplace)')`;
+  const statusExpr = `LOWER(TRIM(COALESCE(o.current_status, '')))`;
+
+  const buildSql = (bucket: 'novos' | 'faturados' | 'em_transporte' | 'entregues' | 'cancelados') => {
+    const filt =
+      bucket === 'novos'
+        ? `st = ANY($${params.length + (useItemsFilter ? 3 : 1)}::text[])`
+        : bucket === 'faturados'
+          ? `(st = 'faturando' OR st = 'aguardando transporte')`
+          : bucket === 'em_transporte'
+            ? `st = ANY($${params.length + (useItemsFilter ? 4 : 2)}::text[])`
+            : bucket === 'entregues'
+              ? `st = 'entregue'`
+              : `st = ANY($${params.length + (useItemsFilter ? 5 : 3)}::text[])`;
+
+    const idxNovos = params.length + (useItemsFilter ? 3 : 1);
+    const idxTransit = params.length + (useItemsFilter ? 4 : 2);
+    const idxCancel = params.length + (useItemsFilter ? 5 : 3);
+    const pLimitIdx = idxCancel + 1;
+    return useItemsFilter
+      ? `
+      WITH meta AS (
+        SELECT (now() AT TIME ZONE 'America/Sao_Paulo')::date AS today
+      ),
+      typed AS (
+        SELECT
+          $${idxNovos}::text[] AS novos,
+          $${idxTransit}::text[] AS em_transporte,
+          $${idxCancel}::text[] AS cancelados
+      ),
+      base AS (
+        SELECT DISTINCT
+          o.id,
+          o.order_code,
+          ${mpExpr} AS marketplace,
+          o.order_date::date AS order_day,
+          CASE
+            WHEN o.delivery_date IS NOT NULL THEN o.delivery_date::date
+            WHEN o.order_date IS NOT NULL AND o.delivery_days IS NOT NULL THEN (o.order_date::date + (o.delivery_days::int * interval '1 day'))::date
+            ELSE NULL
+          END AS delivery_deadline,
+          ${statusExpr} AS st
+        FROM orders o
+        JOIN companies c ON c.id = o.company_id
+        JOIN order_items i ON i.order_id = o.id
+        JOIN products p ON p.id = i.product_id
+        WHERE ${where.join(' AND ')}
+          AND (CASE WHEN $${params.length + 1}::text[] IS NULL OR array_length($${params.length + 1}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${params.length + 1}::text[]) END)
+          AND (CASE WHEN $${params.length + 2}::text[] IS NULL OR array_length($${params.length + 2}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${params.length + 2}::text[]) END)
+      )
+      SELECT
+        id,
+        order_code,
+        marketplace,
+        to_char(order_day, 'YYYY-MM-DD') AS order_day,
+        CASE WHEN delivery_deadline IS NULL THEN NULL ELSE to_char(delivery_deadline, 'YYYY-MM-DD') END AS delivery_deadline,
+        GREATEST(((SELECT today FROM meta) - order_day), 0)::int AS days_since_order,
+        CASE WHEN delivery_deadline IS NOT NULL AND (SELECT today FROM meta) > delivery_deadline THEN TRUE ELSE FALSE END AS is_overdue,
+        st AS status
+      FROM base
+      CROSS JOIN typed
+      WHERE ${filt}
+      ORDER BY order_day ASC, order_code ASC
+      LIMIT $${pLimitIdx}::int
+      `
+      : `
+      WITH meta AS (
+        SELECT (now() AT TIME ZONE 'America/Sao_Paulo')::date AS today
+      )
+      , typed AS (
+        SELECT
+          $${idxNovos}::text[] AS novos,
+          $${idxTransit}::text[] AS em_transporte,
+          $${idxCancel}::text[] AS cancelados
+      )
+      SELECT
+        o.id,
+        o.order_code,
+        ${mpExpr} AS marketplace,
+        to_char(o.order_date::date, 'YYYY-MM-DD') AS order_day,
+        CASE
+          WHEN o.delivery_date IS NOT NULL THEN to_char(o.delivery_date::date, 'YYYY-MM-DD')
+          WHEN o.order_date IS NOT NULL AND o.delivery_days IS NOT NULL THEN to_char((o.order_date::date + (o.delivery_days::int * interval '1 day'))::date, 'YYYY-MM-DD')
+          ELSE NULL
+        END AS delivery_deadline,
+        GREATEST(((SELECT today FROM meta) - o.order_date::date), 0)::int AS days_since_order,
+        CASE
+          WHEN o.delivery_date IS NOT NULL AND (SELECT today FROM meta) > o.delivery_date::date THEN TRUE
+          WHEN o.delivery_date IS NULL AND o.order_date IS NOT NULL AND o.delivery_days IS NOT NULL
+               AND (SELECT today FROM meta) > (o.order_date::date + (o.delivery_days::int * interval '1 day'))::date
+            THEN TRUE
+          ELSE FALSE
+        END AS is_overdue,
+        ${statusExpr} AS status
+      FROM orders o
+      JOIN companies c ON c.id = o.company_id
+      CROSS JOIN typed
+      WHERE ${where.join(' AND ')}
+        AND ${filt.split('st').join(statusExpr)}
+      ORDER BY o.order_date::date ASC, o.order_code ASC
+      LIMIT $${pLimitIdx}::int
+      `;
+  };
+
+  const rowsByBucketParams = useItemsFilter
+    ? [...params, categories.length ? categories : null, skus.length ? skus : null, novos, emTransporte, cancelados, limit]
+    : [...params, novos, emTransporte, cancelados, limit];
+
+  const [novosRows, faturadosRows, emTransporteRows, entreguesRows, canceladosRows] = await Promise.all([
+    AppDataSource.query(buildSql('novos'), rowsByBucketParams),
+    AppDataSource.query(buildSql('faturados'), rowsByBucketParams),
+    AppDataSource.query(buildSql('em_transporte'), rowsByBucketParams),
+    AppDataSource.query(buildSql('entregues'), rowsByBucketParams),
+    AppDataSource.query(buildSql('cancelados'), rowsByBucketParams),
+  ]);
+
+  const mapRow = (r: any) => ({
+    id: Number(r.id ?? 0) || 0,
+    orderCode: Number(r.order_code ?? 0) || 0,
+    marketplace: String(r.marketplace ?? ''),
+    orderDate: r.order_day ? String(r.order_day) : null,
+    deliveryDeadline: r.delivery_deadline ? String(r.delivery_deadline) : null,
+    daysSinceOrder: Number(r.days_since_order ?? 0) || 0,
+    isOverdue: Boolean(r.is_overdue),
+    status: String(r.status ?? ''),
+  });
+
+  return res.json({
+    start,
+    end,
+    limit,
+    columns: {
+      novos: (novosRows || []).map(mapRow),
+      faturados: (faturadosRows || []).map(mapRow),
+      emTransporte: (emTransporteRows || []).map(mapRow),
+      entregues: (entreguesRows || []).map(mapRow),
+      cancelados: (canceladosRows || []).map(mapRow),
+    },
+  });
+});
+
+function isIsoYm(value: string): boolean {
+  return /^\d{4}-\d{2}$/.test(value);
+}
+
+type MonthKpis = {
+  revenueSoFar: number;
+  revenueMonth: number;
+  orders: number;
+  uniqueCustomers: number;
+  itemsSold: number;
+  skusCount: number;
+  avgTicket: number;
+  cartItemsAdded: number;
+  conversionPct: number;
+};
+
+companiesRouter.get('/me/dashboard/month/overview', async (req: Request, res: Response) => {
+  const userId = await getAuthUserId(req);
+  if (!userId) return res.status(401).json({ message: 'Não autenticado' });
+
+  const filter = await getAuthCompanyGroupFilter(req);
+  if (!filter) return res.status(400).json({ message: 'Company not configured for this user' });
+
+  const { companyId, groupId } = filter;
+  const param = groupId ?? companyId;
+  const condOrders = groupId ? 'c.group_id = $1' : 'o.company_id = $1';
+
+  const monthRaw = String((req.query as any)?.month ?? '').trim();
+  const month = monthRaw ? monthRaw : null;
+  if (month && !isIsoYm(month)) return res.status(400).json({ message: 'Parâmetro inválido: month deve estar em YYYY-MM.' });
+
+  const toStringArray = (v: any): string[] => {
+    if (!v) return [];
+    const raw = Array.isArray(v) ? v : [v];
+    return raw.map((x) => String(x).trim()).filter(Boolean);
+  };
+
+  const channels = toStringArray((req.query as any)?.channel);
+  const categories = toStringArray((req.query as any)?.category);
+  const states = toStringArray((req.query as any)?.state).map((s) => s.toUpperCase());
+  const cities = toStringArray((req.query as any)?.city);
+  const skus = toStringArray((req.query as any)?.sku);
+  const companyIds = toStringArray((req.query as any)?.company_id)
+    .map((s) => Number(s))
+    .filter((n) => Number.isInteger(n) && n > 0);
+
+  const useItemsRevenue = Boolean(categories.length || skus.length);
+
+  // Drilldown de categoria (aplica somente nos agregados de categoria)
+  type CategoryDrillLevel = 'category' | 'subcategory' | 'final';
+  const categoryLevelRaw = String((req.query as any)?.category_level ?? 'category')
+    .trim()
+    .toLowerCase();
+  const categoryLevel: CategoryDrillLevel =
+    categoryLevelRaw === 'subcategory' ? 'subcategory' : categoryLevelRaw === 'final' ? 'final' : 'category';
+  const drillCategory = String((req.query as any)?.drill_category ?? '').trim();
+  const drillSubcategory = String((req.query as any)?.drill_subcategory ?? '').trim();
+  const categoryExpr =
+    categoryLevel === 'category' ? 'p.category' : categoryLevel === 'subcategory' ? 'p.subcategory' : 'p.final_category';
+  const categoryEmptyLabel =
+    categoryLevel === 'category' ? '(sem categoria)' : categoryLevel === 'subcategory' ? '(sem subcategoria)' : '(sem categoria final)';
+  const categoryIdExpr = `COALESCE(NULLIF(TRIM(${categoryExpr}), ''), '${categoryEmptyLabel}')`;
+  const drillCategoryExpr = `COALESCE(NULLIF(TRIM(p.category), ''), '(sem categoria)')`;
+  const drillSubcategoryExpr = `COALESCE(NULLIF(TRIM(p.subcategory), ''), '(sem subcategoria)')`;
+  const drillCategoryParam = categoryLevel === 'category' ? null : drillCategory || null;
+  const drillSubcategoryParam = categoryLevel === 'final' ? drillSubcategory || null : null;
+
+  try {
+    const baseDay = month ? `${month}-01` : null;
+    const metaRows = await AppDataSource.query(
+      `
+      WITH x AS (
+        SELECT
+          (now() AT TIME ZONE 'America/Sao_Paulo')::date AS today,
+          COALESCE($1::date, (now() AT TIME ZONE 'America/Sao_Paulo')::date) AS base_day
+      ),
+      m AS (
+        SELECT
+          date_trunc('month', base_day)::date AS month_start,
+          (date_trunc('month', base_day) + interval '1 month - 1 day')::date AS month_end,
+          date_trunc('month', today)::date AS actual_month_start,
+          (date_trunc('month', today) + interval '1 month - 1 day')::date AS actual_month_end,
+          today
+        FROM x
+      )
+      SELECT
+        to_char(month_start, 'YYYY-MM') AS month,
+        to_char(month_start, 'YYYY-MM-DD') AS month_start,
+        to_char(month_end, 'YYYY-MM-DD') AS month_end,
+        EXTRACT(day FROM month_end)::int AS days_in_month,
+        (month_start = actual_month_start) AS is_live_month,
+        EXTRACT(day FROM today)::int AS today_day,
+        to_char((month_start - interval '1 month')::date, 'YYYY-MM-DD') AS m1_start,
+        to_char((month_start - interval '1 day')::date, 'YYYY-MM-DD') AS m1_end,
+        to_char((month_start - interval '2 months')::date, 'YYYY-MM-DD') AS m2_start,
+        to_char((month_start - interval '1 month - 1 day')::date, 'YYYY-MM-DD') AS m2_end,
+        to_char((month_start - interval '6 months')::date, 'YYYY-MM-DD') AS m6_start,
+        to_char((month_start - interval '5 months - 1 day')::date, 'YYYY-MM-DD') AS m6_end,
+        to_char((month_start - interval '12 months')::date, 'YYYY-MM-DD') AS m12_start,
+        to_char((month_start - interval '11 months - 1 day')::date, 'YYYY-MM-DD') AS m12_end,
+        to_char(actual_month_start, 'YYYY-MM') AS actual_month
+      FROM m
+      `,
+      [baseDay],
+    );
+    const meta = metaRows?.[0] || {};
+    const selectedMonth = String(meta.month || '').trim();
+    const actualMonth = String(meta.actual_month || '').trim();
+    if (!selectedMonth) return res.status(500).json({ message: 'Falha ao calcular mês.' });
+    if (actualMonth && selectedMonth > actualMonth) return res.status(400).json({ message: `month não pode ser maior que o mês atual (${actualMonth}).` });
+
+    const isLiveMonth = Boolean(meta.is_live_month);
+    const daysInMonth = Number(meta.days_in_month ?? 30) || 30;
+    const todayDay = Number(meta.today_day ?? 1) || 1;
+    const currentDay = isLiveMonth ? Math.min(Math.max(todayDay, 1), daysInMonth) : daysInMonth;
+
+    const periods = {
+      selected: { start: String(meta.month_start), end: String(meta.month_end) },
+      m1: { start: String(meta.m1_start), end: String(meta.m1_end) },
+      m2: { start: String(meta.m2_start), end: String(meta.m2_end) },
+      m6: { start: String(meta.m6_start), end: String(meta.m6_end) },
+      m12: { start: String(meta.m12_start), end: String(meta.m12_end) },
+    } as const;
+
+    const buildSoFarEnd = async (start: string, end: string): Promise<string> => {
+      // limita pelo final do mês de referência
+      const rows = await AppDataSource.query(
+        `SELECT to_char(LEAST(($1::date + ($3::int - 1) * interval '1 day')::date, $2::date), 'YYYY-MM-DD') AS sofar_end`,
+        [start, end, currentDay],
+      );
+      return String(rows?.[0]?.sofar_end ?? end);
+    };
+
+    const sofarEnds: Record<keyof typeof periods, string> = {
+      selected: isLiveMonth ? await buildSoFarEnd(periods.selected.start, periods.selected.end) : periods.selected.end,
+      m1: await buildSoFarEnd(periods.m1.start, periods.m1.end),
+      m2: await buildSoFarEnd(periods.m2.start, periods.m2.end),
+      m6: await buildSoFarEnd(periods.m6.start, periods.m6.end),
+      m12: await buildSoFarEnd(periods.m12.start, periods.m12.end),
+    };
+
+    const commonWhere: string[] = [`${condOrders}`, `o.order_date IS NOT NULL`];
+    const commonParamsBase: any[] = [param];
+
+    if (groupId && companyIds.length) {
+      commonParamsBase.push(companyIds);
+      commonWhere.push(`o.company_id = ANY($${commonParamsBase.length}::int[])`);
+    }
+    if (channels.length) {
+      commonParamsBase.push(channels);
+      commonWhere.push(`COALESCE(o.marketplace_name, o.channel) = ANY($${commonParamsBase.length}::text[])`);
+    }
+    if (states.length) {
+      commonParamsBase.push(states);
+      commonWhere.push(`UPPER(TRIM(o.delivery_state)) = ANY($${commonParamsBase.length}::text[])`);
+    }
+    if (cities.length) {
+      commonParamsBase.push(cities);
+      commonWhere.push(`o.delivery_city = ANY($${commonParamsBase.length}::text[])`);
+    }
+
+    const revenueExpr = `
+      (COALESCE(o.total_amount, 0)::numeric
+       - COALESCE(o.total_discount, 0)::numeric
+       + COALESCE(o.shipping_amount, 0)::numeric)
+    `;
+
+    const kpisFor = async (key: keyof typeof periods): Promise<MonthKpis> => {
+      const p = periods[key];
+      const sofarEnd = sofarEnds[key];
+
+      if (useItemsRevenue) {
+        const pStartIdx = commonParamsBase.length + 1;
+        const pEndIdx = commonParamsBase.length + 2;
+        const pSofarIdx = commonParamsBase.length + 3;
+        const pCategoriesIdx = commonParamsBase.length + 4;
+        const pSkusIdx = commonParamsBase.length + 5;
+        const rows = await AppDataSource.query(
+          `
+          SELECT
+            COALESCE(SUM(CASE WHEN o.order_date::date BETWEEN $${pStartIdx}::date AND $${pEndIdx}::date THEN (i.unit_price::numeric) * (i.quantity::int) ELSE 0 END), 0)::numeric AS revenue_month,
+            COALESCE(SUM(CASE WHEN o.order_date::date BETWEEN $${pStartIdx}::date AND $${pSofarIdx}::date THEN (i.unit_price::numeric) * (i.quantity::int) ELSE 0 END), 0)::numeric AS revenue_sofar,
+            COUNT(DISTINCT CASE WHEN o.order_date::date BETWEEN $${pStartIdx}::date AND $${pEndIdx}::date THEN o.id END)::int AS orders,
+            COUNT(DISTINCT CASE WHEN o.order_date::date BETWEEN $${pStartIdx}::date AND $${pEndIdx}::date THEN o.customer_id END)::int AS customers,
+            COALESCE(SUM(CASE WHEN o.order_date::date BETWEEN $${pStartIdx}::date AND $${pEndIdx}::date THEN (i.quantity::int) ELSE 0 END), 0)::int AS items_sold,
+            COUNT(DISTINCT CASE WHEN o.order_date::date BETWEEN $${pStartIdx}::date AND $${pEndIdx}::date THEN p.sku END)::int AS skus_count
+          FROM orders o
+          JOIN companies c ON c.id = o.company_id
+          JOIN order_items i ON i.order_id = o.id
+          JOIN products p ON p.id = i.product_id
+          WHERE ${commonWhere.join(' AND ')}
+            AND (CASE WHEN $${pCategoriesIdx}::text[] IS NULL OR array_length($${pCategoriesIdx}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${pCategoriesIdx}::text[]) END)
+            AND (CASE WHEN $${pSkusIdx}::text[] IS NULL OR array_length($${pSkusIdx}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${pSkusIdx}::text[]) END)
+          `,
+          [...commonParamsBase, p.start, p.end, sofarEnd, categories.length ? categories : null, skus.length ? skus : null],
+        );
+        const r = rows?.[0] || {};
+        const revenueMonth = Number(r.revenue_month ?? 0) || 0;
+        const orders = Number(r.orders ?? 0) || 0;
+        return {
+          revenueSoFar: Number(r.revenue_sofar ?? 0) || 0,
+          revenueMonth,
+          orders,
+          uniqueCustomers: Number(r.customers ?? 0) || 0,
+          itemsSold: Number(r.items_sold ?? 0) || 0,
+          skusCount: Number(r.skus_count ?? 0) || 0,
+          avgTicket: orders > 0 ? revenueMonth / orders : 0,
+          cartItemsAdded: 0,
+          conversionPct: 0,
+        };
+      }
+
+      const pStartIdx = commonParamsBase.length + 1;
+      const pEndIdx = commonParamsBase.length + 2;
+      const pSofarIdx = commonParamsBase.length + 3;
+      const rows = await AppDataSource.query(
+        `
+        SELECT
+          COALESCE(SUM(CASE WHEN o.order_date::date BETWEEN $${pStartIdx}::date AND $${pEndIdx}::date THEN ${revenueExpr} ELSE 0 END), 0)::numeric AS revenue_month,
+          COALESCE(SUM(CASE WHEN o.order_date::date BETWEEN $${pStartIdx}::date AND $${pSofarIdx}::date THEN ${revenueExpr} ELSE 0 END), 0)::numeric AS revenue_sofar,
+          COUNT(DISTINCT CASE WHEN o.order_date::date BETWEEN $${pStartIdx}::date AND $${pEndIdx}::date THEN o.id END)::int AS orders,
+          COUNT(DISTINCT CASE WHEN o.order_date::date BETWEEN $${pStartIdx}::date AND $${pEndIdx}::date THEN o.customer_id END)::int AS customers
+        FROM orders o
+        JOIN companies c ON c.id = o.company_id
+        WHERE ${commonWhere.join(' AND ')}
+        `,
+        [...commonParamsBase, p.start, p.end, sofarEnd],
+      );
+      const r = rows?.[0] || {};
+      const revenueMonth = Number(r.revenue_month ?? 0) || 0;
+      const orders = Number(r.orders ?? 0) || 0;
+
+      const iStartIdx = commonParamsBase.length + 1;
+      const iEndIdx = commonParamsBase.length + 2;
+      const itemsRows = await AppDataSource.query(
+        `
+        SELECT
+          COALESCE(SUM(i.quantity::int), 0)::int AS items_sold,
+          COUNT(DISTINCT p.sku)::int AS skus_count
+        FROM orders o
+        JOIN companies c ON c.id = o.company_id
+        JOIN order_items i ON i.order_id = o.id
+        JOIN products p ON p.id = i.product_id
+        WHERE ${commonWhere.join(' AND ')}
+          AND o.order_date::date BETWEEN $${iStartIdx}::date AND $${iEndIdx}::date
+        `,
+        [...commonParamsBase, p.start, p.end],
+      );
+      const ir = itemsRows?.[0] || {};
+
+      return {
+        revenueSoFar: Number(r.revenue_sofar ?? 0) || 0,
+        revenueMonth,
+        orders,
+        uniqueCustomers: Number(r.customers ?? 0) || 0,
+        itemsSold: Number(ir.items_sold ?? 0) || 0,
+        skusCount: Number(ir.skus_count ?? 0) || 0,
+        avgTicket: orders > 0 ? revenueMonth / orders : 0,
+        cartItemsAdded: 0,
+        conversionPct: 0,
+      };
+    };
+
+    const dailyFor = async (key: keyof typeof periods) => {
+      const p = periods[key];
+      if (useItemsRevenue) {
+        const pStartIdx = commonParamsBase.length + 1;
+        const pEndIdx = commonParamsBase.length + 2;
+        const pCategoriesIdx = commonParamsBase.length + 3;
+        const pSkusIdx = commonParamsBase.length + 4;
+        const rows = await AppDataSource.query(
+          `
+          WITH days AS (
+            SELECT generate_series($${pStartIdx}::date, $${pEndIdx}::date, '1 day'::interval)::date AS day
+          ),
+          agg AS (
+            SELECT o.order_date::date AS day, COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric AS revenue
+            FROM orders o
+            JOIN companies c ON c.id = o.company_id
+            JOIN order_items i ON i.order_id = o.id
+            JOIN products p ON p.id = i.product_id
+            WHERE ${commonWhere.join(' AND ')}
+              AND o.order_date::date BETWEEN $${pStartIdx}::date AND $${pEndIdx}::date
+              AND (CASE WHEN $${pCategoriesIdx}::text[] IS NULL OR array_length($${pCategoriesIdx}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${pCategoriesIdx}::text[]) END)
+              AND (CASE WHEN $${pSkusIdx}::text[] IS NULL OR array_length($${pSkusIdx}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${pSkusIdx}::text[]) END)
+            GROUP BY 1
+          )
+          SELECT EXTRACT(day FROM d.day)::int AS day, COALESCE(a.revenue, 0)::numeric AS revenue
+          FROM days d
+          LEFT JOIN agg a ON a.day = d.day
+          ORDER BY d.day ASC
+          `,
+          [...commonParamsBase, p.start, p.end, categories.length ? categories : null, skus.length ? skus : null],
+        );
+        return (rows || []).map((r: any) => ({ period: key, day: Number(r.day ?? 0) || 0, revenue: Number(r.revenue ?? 0) || 0 }));
+      }
+
+      const pStartIdx = commonParamsBase.length + 1;
+      const pEndIdx = commonParamsBase.length + 2;
+      const rows = await AppDataSource.query(
+        `
+        WITH days AS (
+          SELECT generate_series($${pStartIdx}::date, $${pEndIdx}::date, '1 day'::interval)::date AS day
+        ),
+        agg AS (
+          SELECT o.order_date::date AS day, COALESCE(SUM(${revenueExpr}), 0)::numeric AS revenue
+          FROM orders o
+          JOIN companies c ON c.id = o.company_id
+          WHERE ${commonWhere.join(' AND ')}
+            AND o.order_date::date BETWEEN $${pStartIdx}::date AND $${pEndIdx}::date
+          GROUP BY 1
+        )
+        SELECT EXTRACT(day FROM d.day)::int AS day, COALESCE(a.revenue, 0)::numeric AS revenue
+        FROM days d
+        LEFT JOIN agg a ON a.day = d.day
+        ORDER BY d.day ASC
+        `,
+        [...commonParamsBase, p.start, p.end],
+      );
+      return (rows || []).map((r: any) => ({ period: key, day: Number(r.day ?? 0) || 0, revenue: Number(r.revenue ?? 0) || 0 }));
+    };
+
+    const marketplaceTableFor = async (key: keyof typeof periods) => {
+      const p = periods[key];
+      if (useItemsRevenue) {
+        const pStartIdx = commonParamsBase.length + 1;
+        const pEndIdx = commonParamsBase.length + 2;
+        const pCategoriesIdx = commonParamsBase.length + 3;
+        const pSkusIdx = commonParamsBase.length + 4;
+        const rows = await AppDataSource.query(
+          `
+          SELECT
+            COALESCE(NULLIF(TRIM(COALESCE(o.marketplace_name, o.channel)), ''), '(sem marketplace)') AS id,
+            COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric AS revenue,
+            COUNT(DISTINCT o.id)::int AS orders_count,
+            CASE WHEN COUNT(DISTINCT o.id) > 0 THEN (COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric / COUNT(DISTINCT o.id)) ELSE 0 END AS avg_ticket
+          FROM orders o
+          JOIN companies c ON c.id = o.company_id
+          JOIN order_items i ON i.order_id = o.id
+          JOIN products p ON p.id = i.product_id
+          WHERE ${commonWhere.join(' AND ')}
+            AND o.order_date::date BETWEEN $${pStartIdx}::date AND $${pEndIdx}::date
+            AND (CASE WHEN $${pCategoriesIdx}::text[] IS NULL OR array_length($${pCategoriesIdx}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${pCategoriesIdx}::text[]) END)
+            AND (CASE WHEN $${pSkusIdx}::text[] IS NULL OR array_length($${pSkusIdx}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${pSkusIdx}::text[]) END)
+          GROUP BY 1
+          ORDER BY revenue DESC NULLS LAST
+          LIMIT 50
+          `,
+          [...commonParamsBase, p.start, p.end, categories.length ? categories : null, skus.length ? skus : null],
+        );
+        return (rows || []).map((r: any) => ({ id: String(r.id), revenue: Number(r.revenue ?? 0) || 0, ordersCount: Number(r.orders_count ?? 0) || 0, avgTicket: Number(r.avg_ticket ?? 0) || 0 }));
+      }
+      const pStartIdx = commonParamsBase.length + 1;
+      const pEndIdx = commonParamsBase.length + 2;
+      const rows = await AppDataSource.query(
+        `
+        SELECT
+          COALESCE(NULLIF(TRIM(COALESCE(o.marketplace_name, o.channel)), ''), '(sem marketplace)') AS id,
+          COALESCE(SUM(${revenueExpr}), 0)::numeric AS revenue,
+          COUNT(DISTINCT o.id)::int AS orders_count,
+          CASE WHEN COUNT(DISTINCT o.id) > 0 THEN (COALESCE(SUM(${revenueExpr}), 0)::numeric / COUNT(DISTINCT o.id)) ELSE 0 END AS avg_ticket
+        FROM orders o
+        JOIN companies c ON c.id = o.company_id
+        WHERE ${commonWhere.join(' AND ')}
+          AND o.order_date::date BETWEEN $${pStartIdx}::date AND $${pEndIdx}::date
+        GROUP BY 1
+        ORDER BY revenue DESC NULLS LAST
+        LIMIT 50
+        `,
+        [...commonParamsBase, p.start, p.end],
+      );
+      return (rows || []).map((r: any) => ({ id: String(r.id), revenue: Number(r.revenue ?? 0) || 0, ordersCount: Number(r.orders_count ?? 0) || 0, avgTicket: Number(r.avg_ticket ?? 0) || 0 }));
+    };
+
+    const stateTableFor = async (key: keyof typeof periods) => {
+      const p = periods[key];
+      const pStartIdx = commonParamsBase.length + 1;
+      const pEndIdx = commonParamsBase.length + 2;
+      const pCategoriesIdx = commonParamsBase.length + 3;
+      const pSkusIdx = commonParamsBase.length + 4;
+      const rows = await AppDataSource.query(
+        useItemsRevenue
+          ? `
+            SELECT
+              COALESCE(NULLIF(TRIM(UPPER(o.delivery_state)), ''), '(sem UF)') AS id,
+              COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric AS revenue,
+              COUNT(DISTINCT o.id)::int AS orders_count,
+              CASE WHEN COUNT(DISTINCT o.id) > 0 THEN (COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric / COUNT(DISTINCT o.id)) ELSE 0 END AS avg_ticket
+            FROM orders o
+            JOIN companies c ON c.id = o.company_id
+            JOIN order_items i ON i.order_id = o.id
+            JOIN products p ON p.id = i.product_id
+            WHERE ${commonWhere.join(' AND ')}
+              AND o.order_date::date BETWEEN $${pStartIdx}::date AND $${pEndIdx}::date
+              AND (CASE WHEN $${pCategoriesIdx}::text[] IS NULL OR array_length($${pCategoriesIdx}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${pCategoriesIdx}::text[]) END)
+              AND (CASE WHEN $${pSkusIdx}::text[] IS NULL OR array_length($${pSkusIdx}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${pSkusIdx}::text[]) END)
+            GROUP BY 1
+            ORDER BY revenue DESC NULLS LAST
+            LIMIT 50
+          `
+          : `
+            SELECT
+              COALESCE(NULLIF(TRIM(UPPER(o.delivery_state)), ''), '(sem UF)') AS id,
+              COALESCE(SUM(${revenueExpr}), 0)::numeric AS revenue,
+              COUNT(DISTINCT o.id)::int AS orders_count,
+              CASE WHEN COUNT(DISTINCT o.id) > 0 THEN (COALESCE(SUM(${revenueExpr}), 0)::numeric / COUNT(DISTINCT o.id)) ELSE 0 END AS avg_ticket
+            FROM orders o
+            JOIN companies c ON c.id = o.company_id
+            WHERE ${commonWhere.join(' AND ')}
+              AND o.order_date::date BETWEEN $${pStartIdx}::date AND $${pEndIdx}::date
+            GROUP BY 1
+            ORDER BY revenue DESC NULLS LAST
+            LIMIT 50
+          `,
+        useItemsRevenue ? [...commonParamsBase, p.start, p.end, categories.length ? categories : null, skus.length ? skus : null] : [...commonParamsBase, p.start, p.end],
+      );
+      return (rows || []).map((r: any) => ({ id: String(r.id), revenue: Number(r.revenue ?? 0) || 0, ordersCount: Number(r.orders_count ?? 0) || 0, avgTicket: Number(r.avg_ticket ?? 0) || 0 }));
+    };
+
+    const categoryTableFor = async (key: keyof typeof periods) => {
+      const p = periods[key];
+      const pStartIdx = commonParamsBase.length + 1;
+      const pEndIdx = commonParamsBase.length + 2;
+      const pCategoriesIdx = commonParamsBase.length + 3;
+      const pSkusIdx = commonParamsBase.length + 4;
+      const pDrillCategoryIdx = commonParamsBase.length + 5;
+      const pDrillSubcategoryIdx = commonParamsBase.length + 6;
+      const rows = await AppDataSource.query(
+        `
+        SELECT
+          ${categoryIdExpr} AS id,
+          COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric AS revenue,
+          COUNT(DISTINCT o.id)::int AS orders_count,
+          CASE WHEN COUNT(DISTINCT o.id) > 0 THEN (COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric / COUNT(DISTINCT o.id)) ELSE 0 END AS avg_ticket
+        FROM orders o
+        JOIN companies c ON c.id = o.company_id
+        JOIN order_items i ON i.order_id = o.id
+        JOIN products p ON p.id = i.product_id
+        WHERE ${commonWhere.join(' AND ')}
+          AND o.order_date::date BETWEEN $${pStartIdx}::date AND $${pEndIdx}::date
+          AND (CASE WHEN $${pCategoriesIdx}::text[] IS NULL OR array_length($${pCategoriesIdx}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${pCategoriesIdx}::text[]) END)
+          AND (CASE WHEN $${pSkusIdx}::text[] IS NULL OR array_length($${pSkusIdx}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${pSkusIdx}::text[]) END)
+          AND (CASE WHEN $${pDrillCategoryIdx}::text IS NULL OR $${pDrillCategoryIdx}::text = '' THEN TRUE ELSE ${drillCategoryExpr} = $${pDrillCategoryIdx}::text END)
+          AND (CASE WHEN $${pDrillSubcategoryIdx}::text IS NULL OR $${pDrillSubcategoryIdx}::text = '' THEN TRUE ELSE ${drillSubcategoryExpr} = $${pDrillSubcategoryIdx}::text END)
+        GROUP BY 1
+        ORDER BY revenue DESC NULLS LAST
+        LIMIT 50
+        `,
+        [
+          ...commonParamsBase,
+          p.start,
+          p.end,
+          categories.length ? categories : null,
+          skus.length ? skus : null,
+          drillCategoryParam,
+          drillSubcategoryParam,
+        ],
+      );
+      return (rows || []).map((r: any) => ({ id: String(r.id), revenue: Number(r.revenue ?? 0) || 0, ordersCount: Number(r.orders_count ?? 0) || 0, avgTicket: Number(r.avg_ticket ?? 0) || 0 }));
+    };
+
+    const [kSelected, kM1, kM2, kM6, kM12] = await Promise.all([kpisFor('selected'), kpisFor('m1'), kpisFor('m2'), kpisFor('m6'), kpisFor('m12')]);
+    const [dSelected, dM1, dM2, dM6, dM12] = await Promise.all([
+      dailyFor('selected'),
+      dailyFor('m1'),
+      dailyFor('m2'),
+      dailyFor('m6'),
+      dailyFor('m12'),
+    ]);
+
+    const projectedMonthTotal = isLiveMonth && currentDay > 0 ? (kSelected.revenueSoFar * daysInMonth) / currentDay : kSelected.revenueMonth;
+
+    const [mpSel, mpM1, mpM2, mpM6, mpM12] = await Promise.all([
+      marketplaceTableFor('selected'),
+      marketplaceTableFor('m1'),
+      marketplaceTableFor('m2'),
+      marketplaceTableFor('m6'),
+      marketplaceTableFor('m12'),
+    ]);
+    const [stSel, stM1, stM2, stM6, stM12] = await Promise.all([
+      stateTableFor('selected'),
+      stateTableFor('m1'),
+      stateTableFor('m2'),
+      stateTableFor('m6'),
+      stateTableFor('m12'),
+    ]);
+    const [catSel, catM1, catM2, catM6, catM12] = await Promise.all([
+      categoryTableFor('selected'),
+      categoryTableFor('m1'),
+      categoryTableFor('m2'),
+      categoryTableFor('m6'),
+      categoryTableFor('m12'),
+    ]);
+
+    const pStartIdx = commonParamsBase.length + 1;
+    const pEndIdx = commonParamsBase.length + 2;
+    const pCategoriesIdx = commonParamsBase.length + 3;
+    const pSkusIdx = commonParamsBase.length + 4;
+    const topProducts = await AppDataSource.query(
+      `
+      SELECT
+        MAX(p.id)::int AS product_id,
+        p.sku AS sku,
+        MAX(p.name) AS name,
+        MAX(p.photo) AS photo,
+        MAX(p.url) AS url,
+        COALESCE(SUM(i.quantity::int), 0)::int AS qty,
+        COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric AS revenue
+      FROM orders o
+      JOIN companies c ON c.id = o.company_id
+      JOIN order_items i ON i.order_id = o.id
+      JOIN products p ON p.id = i.product_id
+      WHERE ${commonWhere.join(' AND ')}
+        AND o.order_date::date BETWEEN $${pStartIdx}::date AND $${pEndIdx}::date
+        AND (CASE WHEN $${pCategoriesIdx}::text[] IS NULL OR array_length($${pCategoriesIdx}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${pCategoriesIdx}::text[]) END)
+        AND (CASE WHEN $${pSkusIdx}::text[] IS NULL OR array_length($${pSkusIdx}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${pSkusIdx}::text[]) END)
+      GROUP BY p.sku
+      ORDER BY revenue DESC NULLS LAST
+      LIMIT 20
+      `,
+      [...commonParamsBase, periods.selected.start, periods.selected.end, categories.length ? categories : null, skus.length ? skus : null],
+    );
+
+    const productTableFor = async (key: keyof typeof periods) => {
+      const p = periods[key];
+      const pStartIdx = commonParamsBase.length + 1;
+      const pEndIdx = commonParamsBase.length + 2;
+      const pCategoriesIdx = commonParamsBase.length + 3;
+      const pSkusIdx = commonParamsBase.length + 4;
+      const rows = await AppDataSource.query(
+        `
+        SELECT
+          MAX(p.id)::int AS product_id,
+          p.sku AS sku,
+          MAX(p.name) AS name,
+          COUNT(DISTINCT o.id)::int AS orders_count,
+          COALESCE(SUM((i.unit_price::numeric) * (i.quantity::int)), 0)::numeric AS revenue
+        FROM orders o
+        JOIN companies c ON c.id = o.company_id
+        JOIN order_items i ON i.order_id = o.id
+        JOIN products p ON p.id = i.product_id
+        WHERE ${commonWhere.join(' AND ')}
+          AND o.order_date::date BETWEEN $${pStartIdx}::date AND $${pEndIdx}::date
+          AND (CASE WHEN $${pCategoriesIdx}::text[] IS NULL OR array_length($${pCategoriesIdx}::text[], 1) IS NULL THEN TRUE ELSE COALESCE(p.final_category, p.category) = ANY($${pCategoriesIdx}::text[]) END)
+          AND (CASE WHEN $${pSkusIdx}::text[] IS NULL OR array_length($${pSkusIdx}::text[], 1) IS NULL THEN TRUE ELSE p.sku = ANY($${pSkusIdx}::text[]) END)
+        GROUP BY p.sku
+        ORDER BY revenue DESC NULLS LAST, sku ASC
+        LIMIT 500
+        `,
+        [...commonParamsBase, p.start, sofarEnds[key], categories.length ? categories : null, skus.length ? skus : null],
+      );
+
+      return (rows || []).map((r: any) => {
+        const revenue = Number(r.revenue ?? 0) || 0;
+        const ordersCount = Number(r.orders_count ?? 0) || 0;
+        return {
+          productId: Number(r.product_id ?? 0) || null,
+          sku: String(r.sku ?? ''),
+          name: r.name ?? null,
+          revenue,
+          ordersCount,
+          avgTicket: ordersCount > 0 ? revenue / ordersCount : 0,
+        };
+      });
+    };
+
+    // Tabela final de SKUs (fixa: mês selecionado vs M-1, ambos "até agora" quando mês ao vivo)
+    const [prodSelected, prodM1] = await Promise.all([productTableFor('selected'), productTableFor('m1')]);
+
+    return res.json({
+      month: selectedMonth,
+      isLiveMonth,
+      currentDay,
+      daysInMonth,
+      projection: { projectedMonthTotal },
+      kpis: { selected: kSelected, m1: kM1, m2: kM2, m6: kM6, m12: kM12 },
+      daily: [...dSelected, ...dM1, ...dM2, ...dM6, ...dM12],
+      topProducts: (topProducts || []).map((r: any) => ({
+        productId: Number(r.product_id ?? 0) || null,
+        sku: String(r.sku ?? ''),
+        name: r.name ?? null,
+        photo: r.photo ?? null,
+        url: r.url ?? null,
+        qty: Number(r.qty ?? 0) || 0,
+        revenue: Number(r.revenue ?? 0) || 0,
+      })),
+      byMarketplace: (mpSel || []).map((r: any) => ({ id: String(r.id), value: Number(r.revenue ?? 0) || 0 })),
+      byMarketplaceTableByPeriod: { selected: mpSel, m1: mpM1, m2: mpM2, m6: mpM6, m12: mpM12 },
+      byState: (stSel || []).map((r: any) => ({ id: String(r.id), value: Number(r.revenue ?? 0) || 0 })),
+      byStateTableByPeriod: { selected: stSel, m1: stM1, m2: stM2, m6: stM6, m12: stM12 },
+      byCategory: (catSel || []).map((r: any) => ({ id: String(r.id), value: Number(r.revenue ?? 0) || 0 })),
+      byCategoryTableByPeriod: { selected: catSel, m1: catM1, m2: catM2, m6: catM6, m12: catM12 },
+      byProductTable: prodSelected,
+      byProductTableM1: prodM1,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ message: err?.message || 'Erro ao carregar mês (overview)' });
   }
 });
 
@@ -1781,6 +3196,13 @@ companiesRouter.get('/me/dashboard/items/overview', async (req: Request, res: Re
         ORDER BY revenue DESC
         LIMIT 6
       ),
+      top_category AS (
+        SELECT category, SUM(revenue)::numeric AS revenue
+        FROM base
+        GROUP BY 1
+        ORDER BY revenue DESC
+        LIMIT 6
+      ),
       days AS (
         SELECT generate_series($2::date, $3::date, '1 day'::interval)::date AS day
       ),
@@ -1793,6 +3215,17 @@ companiesRouter.get('/me/dashboard/items/overview', async (req: Request, res: Re
         JOIN top_final tf ON TRUE
         LEFT JOIN base b ON b.day = d.day AND b.final_category = tf.final_category
         GROUP BY d.day, tf.final_category
+        ORDER BY d.day ASC
+      ),
+      daily_category AS (
+        SELECT
+          to_char(d.day, 'DD/MM') AS date,
+          tc.category AS category,
+          COALESCE(SUM(b.revenue), 0)::numeric AS revenue
+        FROM days d
+        JOIN top_category tc ON TRUE
+        LEFT JOIN base b ON b.day = d.day AND b.category = tc.category
+        GROUP BY d.day, tc.category
         ORDER BY d.day ASC
       ),
       category_totals AS (
@@ -1854,6 +3287,8 @@ companiesRouter.get('/me/dashboard/items/overview', async (req: Request, res: Re
       SELECT
         (SELECT jsonb_agg(jsonb_build_object('final_category', tf.final_category, 'revenue', tf.revenue) ORDER BY tf.revenue DESC) FROM top_final tf) AS top_final_categories,
         (SELECT jsonb_agg(jsonb_build_object('date', d.date, 'final_category', d.final_category, 'revenue', d.revenue) ORDER BY d.date ASC) FROM daily d) AS daily_by_final_category,
+        (SELECT jsonb_agg(jsonb_build_object('category', tc.category, 'revenue', tc.revenue) ORDER BY tc.revenue DESC) FROM top_category tc) AS top_categories,
+        (SELECT jsonb_agg(jsonb_build_object('date', d.date, 'category', d.category, 'revenue', d.revenue) ORDER BY d.date ASC) FROM daily_category d) AS daily_by_category,
         (SELECT jsonb_agg(jsonb_build_object('category', ct.category, 'revenue', ct.revenue) ORDER BY ct.revenue DESC) FROM category_totals ct) AS category_totals,
         (SELECT jsonb_agg(jsonb_build_object('category', fct.category, 'final_category', fct.final_category, 'revenue', fct.revenue) ORDER BY fct.revenue DESC) FROM final_category_totals fct) AS final_category_totals,
         (SELECT jsonb_agg(jsonb_build_object('sku', tp.sku, 'name', tp.name, 'qty', tp.qty, 'revenue', tp.revenue) ORDER BY tp.revenue DESC) FROM top_products tp) AS top_products,
@@ -1871,6 +3306,8 @@ companiesRouter.get('/me/dashboard/items/overview', async (req: Request, res: Re
       end,
       topFinalCategories: row?.top_final_categories ?? [],
       dailyByFinalCategory: row?.daily_by_final_category ?? [],
+      topCategories: row?.top_categories ?? [],
+      dailyByCategory: row?.daily_by_category ?? [],
       categoryTotals: row?.category_totals ?? [],
       finalCategoryTotals: row?.final_category_totals ?? [],
       topProducts: row?.top_products ?? [],
@@ -1881,6 +3318,293 @@ companiesRouter.get('/me/dashboard/items/overview', async (req: Request, res: Re
     });
   } catch (err: any) {
     return res.status(500).json({ message: err?.message || 'Erro ao carregar itens (overview)' });
+  }
+});
+
+// Tabela de SKUs: menor/maior preço e delta de preço médio (primeiro dia vs último dia no período)
+companiesRouter.get('/me/dashboard/items/sku-price-table', async (req: Request, res: Response) => {
+  const userId = await getAuthUserId(req);
+  if (!userId) return res.status(401).json({ message: 'Não autenticado' });
+
+  const filter = await getAuthCompanyGroupFilter(req);
+  if (!filter) return res.status(400).json({ message: 'Company not configured for this user' });
+
+  const start = String((req.query as any)?.start ?? '').trim();
+  const end = String((req.query as any)?.end ?? '').trim();
+  if (!isIsoYmd(start) || !isIsoYmd(end)) {
+    return res.status(400).json({ message: 'Parâmetros inválidos: start/end devem estar em YYYY-MM-DD.' });
+  }
+
+  const { companyId, groupId } = filter;
+  const param = groupId ?? companyId;
+  const condOrders = groupId ? 'c.group_id = $1' : 'o.company_id = $1';
+
+  const toStringArray = (v: any): string[] => {
+    if (!v) return [];
+    const raw = Array.isArray(v) ? v : [v];
+    return raw.map((x) => String(x).trim()).filter(Boolean);
+  };
+
+  const statuses = toStringArray((req.query as any)?.status);
+  const channels = toStringArray((req.query as any)?.channel);
+  const categories = toStringArray((req.query as any)?.category);
+  const states = toStringArray((req.query as any)?.state).map((s) => s.toUpperCase());
+  const cities = toStringArray((req.query as any)?.city);
+  const skus = toStringArray((req.query as any)?.sku);
+  const companyIds = toStringArray((req.query as any)?.company_id)
+    .map((s) => Number(s))
+    .filter((n) => Number.isInteger(n) && n > 0);
+
+  try {
+    const params: any[] = [param, start, end];
+    const where: string[] = [
+      `${condOrders}`,
+      `o.order_date IS NOT NULL`,
+      `o.order_date::date BETWEEN $2::date AND $3::date`,
+    ];
+
+    if (companyIds.length) {
+      params.push(companyIds);
+      where.push(`o.company_id = ANY($${params.length}::int[])`);
+    }
+    if (statuses.length) {
+      params.push(statuses);
+      where.push(`o.current_status = ANY($${params.length}::text[])`);
+    }
+    if (channels.length) {
+      params.push(channels);
+      where.push(`COALESCE(o.marketplace_name, o.channel) = ANY($${params.length}::text[])`);
+    }
+    if (states.length) {
+      params.push(states);
+      where.push(`UPPER(TRIM(o.delivery_state)) = ANY($${params.length}::text[])`);
+    }
+    if (cities.length) {
+      params.push(cities);
+      where.push(`o.delivery_city = ANY($${params.length}::text[])`);
+    }
+    if (categories.length) {
+      params.push(categories);
+      where.push(`COALESCE(p.final_category, p.category) = ANY($${params.length}::text[])`);
+    }
+    if (skus.length) {
+      params.push(skus);
+      where.push(`p.sku = ANY($${params.length}::text[])`);
+    }
+
+    const sql = `
+      WITH base AS (
+        SELECT
+          o.order_date::date AS day,
+          p.sku AS sku,
+          p.name AS name,
+          (i.unit_price::numeric) AS unit_price,
+          COALESCE(i.quantity::int, 0) AS quantity,
+          ((i.unit_price::numeric) * COALESCE(i.quantity::int, 0)) AS revenue
+        FROM orders o
+        JOIN order_items i ON i.order_id = o.id
+        JOIN products p ON p.id = i.product_id
+        JOIN companies c ON c.id = o.company_id
+        WHERE ${where.join(' AND ')}
+          AND p.sku IS NOT NULL AND TRIM(p.sku) <> ''
+          AND i.unit_price IS NOT NULL
+      ),
+      daily AS (
+        SELECT
+          sku,
+          MAX(name) AS name,
+          day,
+          SUM(quantity)::int AS qty,
+          (SUM(revenue) / NULLIF(SUM(quantity), 0))::numeric AS avg_price
+        FROM base
+        GROUP BY 1, 3
+      ),
+      first_last AS (
+        SELECT sku, MIN(day) AS first_day, MAX(day) AS last_day
+        FROM daily
+        GROUP BY 1
+      ),
+      first_price AS (
+        SELECT d.sku, d.avg_price AS first_avg_price
+        FROM daily d
+        JOIN first_last fl ON fl.sku = d.sku AND fl.first_day = d.day
+      ),
+      last_price AS (
+        SELECT d.sku, d.avg_price AS last_avg_price
+        FROM daily d
+        JOIN first_last fl ON fl.sku = d.sku AND fl.last_day = d.day
+      ),
+      agg AS (
+        SELECT
+          sku,
+          MAX(name) AS name,
+          SUM(quantity)::int AS qty,
+          SUM(revenue)::numeric AS revenue,
+          MIN(unit_price)::numeric AS min_price,
+          MAX(unit_price)::numeric AS max_price
+        FROM base
+        GROUP BY 1
+      )
+      SELECT
+        a.sku,
+        a.name,
+        a.qty,
+        a.revenue,
+        a.min_price,
+        a.max_price,
+        fp.first_avg_price,
+        lp.last_avg_price,
+        CASE
+          WHEN a.max_price IS NULL OR a.max_price <= 0 THEN NULL
+          WHEN a.min_price IS NULL THEN NULL
+          ELSE ((a.max_price - a.min_price) / a.max_price)
+        END AS delta_pct
+      FROM agg a
+      LEFT JOIN first_price fp ON fp.sku = a.sku
+      LEFT JOIN last_price lp ON lp.sku = a.sku
+      ORDER BY a.revenue DESC NULLS LAST, a.sku ASC
+      LIMIT 500
+    `;
+
+    const rows = await AppDataSource.query(sql, params);
+    return res.json({
+      start,
+      end,
+      rows: (rows || []).map((r: any) => ({
+        sku: String(r.sku ?? ''),
+        name: r.name ?? null,
+        qty: Number(r.qty ?? 0) || 0,
+        revenue: String(r.revenue ?? '0'),
+        minPrice: String(r.min_price ?? '0'),
+        maxPrice: String(r.max_price ?? '0'),
+        firstAvgPrice: r.first_avg_price === null ? null : String(r.first_avg_price),
+        lastAvgPrice: r.last_avg_price === null ? null : String(r.last_avg_price),
+        deltaPct: r.delta_pct === null ? null : Number(r.delta_pct),
+      })),
+    });
+  } catch (err: any) {
+    return res.status(500).json({ message: err?.message || 'Erro ao carregar tabela de SKUs' });
+  }
+});
+
+// Série diária de um SKU: quantidade (barras) + preço médio (linha)
+companiesRouter.get('/me/dashboard/items/sku-daily', async (req: Request, res: Response) => {
+  const userId = await getAuthUserId(req);
+  if (!userId) return res.status(401).json({ message: 'Não autenticado' });
+
+  const filter = await getAuthCompanyGroupFilter(req);
+  if (!filter) return res.status(400).json({ message: 'Company not configured for this user' });
+
+  const start = String((req.query as any)?.start ?? '').trim();
+  const end = String((req.query as any)?.end ?? '').trim();
+  const sku = String((req.query as any)?.sku ?? '').trim();
+  if (!isIsoYmd(start) || !isIsoYmd(end)) {
+    return res.status(400).json({ message: 'Parâmetros inválidos: start/end devem estar em YYYY-MM-DD.' });
+  }
+  if (!sku) return res.status(400).json({ message: 'Parâmetro obrigatório: sku' });
+
+  const { companyId, groupId } = filter;
+  const param = groupId ?? companyId;
+  const condOrders = groupId ? 'c.group_id = $1' : 'o.company_id = $1';
+
+  const toStringArray = (v: any): string[] => {
+    if (!v) return [];
+    const raw = Array.isArray(v) ? v : [v];
+    return raw.map((x) => String(x).trim()).filter(Boolean);
+  };
+
+  const statuses = toStringArray((req.query as any)?.status);
+  const channels = toStringArray((req.query as any)?.channel);
+  const categories = toStringArray((req.query as any)?.category);
+  const states = toStringArray((req.query as any)?.state).map((s) => s.toUpperCase());
+  const cities = toStringArray((req.query as any)?.city);
+  const companyIds = toStringArray((req.query as any)?.company_id)
+    .map((s) => Number(s))
+    .filter((n) => Number.isInteger(n) && n > 0);
+
+  try {
+    const params: any[] = [param, start, end, sku];
+    const where: string[] = [
+      `${condOrders}`,
+      `o.order_date IS NOT NULL`,
+      `o.order_date::date BETWEEN $2::date AND $3::date`,
+      `p.sku = $4::text`,
+    ];
+
+    if (companyIds.length) {
+      params.push(companyIds);
+      where.push(`o.company_id = ANY($${params.length}::int[])`);
+    }
+    if (statuses.length) {
+      params.push(statuses);
+      where.push(`o.current_status = ANY($${params.length}::text[])`);
+    }
+    if (channels.length) {
+      params.push(channels);
+      where.push(`COALESCE(o.marketplace_name, o.channel) = ANY($${params.length}::text[])`);
+    }
+    if (states.length) {
+      params.push(states);
+      where.push(`UPPER(TRIM(o.delivery_state)) = ANY($${params.length}::text[])`);
+    }
+    if (cities.length) {
+      params.push(cities);
+      where.push(`o.delivery_city = ANY($${params.length}::text[])`);
+    }
+    if (categories.length) {
+      params.push(categories);
+      where.push(`COALESCE(p.final_category, p.category) = ANY($${params.length}::text[])`);
+    }
+
+    const sql = `
+      WITH days AS (
+        SELECT generate_series($2::date, $3::date, '1 day'::interval)::date AS day
+      ),
+      base AS (
+        SELECT
+          o.order_date::date AS day,
+          (i.unit_price::numeric) AS unit_price,
+          COALESCE(i.quantity::int, 0) AS quantity,
+          ((i.unit_price::numeric) * COALESCE(i.quantity::int, 0)) AS revenue
+        FROM orders o
+        JOIN order_items i ON i.order_id = o.id
+        JOIN products p ON p.id = i.product_id
+        JOIN companies c ON c.id = o.company_id
+        WHERE ${where.join(' AND ')}
+          AND i.unit_price IS NOT NULL
+      ),
+      agg AS (
+        SELECT
+          day,
+          SUM(quantity)::int AS qty,
+          (SUM(revenue) / NULLIF(SUM(quantity), 0))::numeric AS avg_price
+        FROM base
+        GROUP BY 1
+      )
+      SELECT
+        to_char(d.day, 'YYYY-MM-DD') AS ymd,
+        to_char(d.day, 'DD/MM') AS date,
+        COALESCE(a.qty, 0)::int AS qty,
+        a.avg_price AS avg_price
+      FROM days d
+      LEFT JOIN agg a ON a.day = d.day
+      ORDER BY d.day ASC
+    `;
+
+    const rows = await AppDataSource.query(sql, params);
+    return res.json({
+      start,
+      end,
+      sku,
+      rows: (rows || []).map((r: any) => ({
+        ymd: String(r.ymd ?? ''),
+        date: String(r.date ?? ''),
+        qty: Number(r.qty ?? 0) || 0,
+        avgPrice: r.avg_price === null ? null : String(r.avg_price),
+      })),
+    });
+  } catch (err: any) {
+    return res.status(500).json({ message: err?.message || 'Erro ao carregar série do SKU' });
   }
 });
 
@@ -1909,6 +3633,22 @@ companiesRouter.get('/me/customers', async (req: Request, res: Response) => {
     .limit(limit)
     .getMany();
 
+  const extractCityState = (addr: any): { city: string | null; state: string | null } => {
+    const obj = addr && typeof addr === 'object' ? addr : null;
+    if (!obj) return { city: null, state: null };
+    const cityRaw =
+      (obj as any).city ??
+      (obj as any).cidade ??
+      (obj as any).locality ??
+      (obj as any).municipio ??
+      (obj as any).municipality ??
+      null;
+    const stateRaw = (obj as any).state ?? (obj as any).uf ?? (obj as any).estado ?? (obj as any).province ?? null;
+    const city = cityRaw ? String(cityRaw).trim() : null;
+    const state = stateRaw ? String(stateRaw).trim() : null;
+    return { city: city || null, state: state || null };
+  };
+
   return res.json(
     rows.map((c) => ({
       id: c.id,
@@ -1916,7 +3656,8 @@ companiesRouter.get('/me/customers', async (req: Request, res: Response) => {
       legal_name: c.legal_name ?? null,
       trade_name: c.trade_name ?? null,
       email: c.email ?? null,
-      status: c.status ?? null,
+      city: extractCityState(c.delivery_address as any).city,
+      state: extractCityState(c.delivery_address as any).state,
       external_id: c.external_id ?? null,
     })),
   );
@@ -2005,14 +3746,42 @@ companiesRouter.get('/me/orders', async (req: Request, res: Response) => {
   if (!companyId) return res.status(400).json({ message: 'Company not configured for this user' });
 
   const q = String((req.query as any)?.q ?? '').trim();
-  const limitRaw = Number((req.query as any)?.limit ?? 50);
-  const limit = Number.isInteger(limitRaw) ? Math.min(Math.max(limitRaw, 1), 200) : 50;
+  const start = String((req.query as any)?.start ?? '').trim();
+  const end = String((req.query as any)?.end ?? '').trim();
+  const day = String((req.query as any)?.day ?? '').trim();
+  const limitRaw = Number((req.query as any)?.limit ?? 100);
+  const limit = Number.isInteger(limitRaw) ? Math.min(Math.max(limitRaw, 1), 200) : 100;
+  const pageRaw = Number((req.query as any)?.page ?? 1);
+  const page = Number.isInteger(pageRaw) ? Math.min(Math.max(pageRaw, 1), 100000) : 1;
+  const offset = (page - 1) * limit;
 
   const repo = AppDataSource.getRepository(Orders);
   const qb = repo
     .createQueryBuilder('o')
-    .leftJoin(Customers, 'c', 'c.id = o.customer_id')
+    .leftJoin(Customers, 'c', 'c.id = o.customer_id AND c.company_id = o.company_id')
     .where('o.company_id = :companyId', { companyId });
+
+  if ((start && !isIsoYmd(start)) || (end && !isIsoYmd(end))) {
+    return res.status(400).json({ message: 'Parâmetros inválidos: start/end devem estar em YYYY-MM-DD.' });
+  }
+  if (day && !isIsoYmd(day)) {
+    return res.status(400).json({ message: 'Parâmetro inválido: day deve estar em YYYY-MM-DD.' });
+  }
+
+  // Filtro simples por dia (preferido para o front); mantém start/end por compat.
+  if (day) {
+    qb.andWhere('o.order_date IS NOT NULL');
+    qb.andWhere('o.order_date::date = :day', { day });
+  } else if (start && end) {
+    qb.andWhere('o.order_date IS NOT NULL');
+    qb.andWhere('o.order_date::date BETWEEN :start AND :end', { start, end });
+  } else if (start) {
+    qb.andWhere('o.order_date IS NOT NULL');
+    qb.andWhere('o.order_date::date >= :start', { start });
+  } else if (end) {
+    qb.andWhere('o.order_date IS NOT NULL');
+    qb.andWhere('o.order_date::date <= :end', { end });
+  }
 
   if (q) {
     qb.andWhere(
@@ -2039,34 +3808,37 @@ companiesRouter.get('/me/orders', async (req: Request, res: Response) => {
       'o.current_status AS current_status',
       'o.total_amount AS total_amount',
       'o.marketplace_name AS marketplace_name',
+      'o.channel AS channel',
       'o.customer_id AS customer_id',
-      'c.trade_name AS customer_trade_name',
-      'c.legal_name AS customer_legal_name',
+      "COALESCE(NULLIF(TRIM(c.trade_name), ''), NULLIF(TRIM(c.legal_name), '')) AS customer_name",
       'c.email AS customer_email',
       'c.tax_id AS customer_tax_id',
     ])
     .orderBy('o.id', 'DESC')
-    .limit(limit)
+    .offset(offset)
+    .limit(limit + 1)
     .getRawMany<any>();
 
-  return res.json(
-    rows.map((r) => ({
+  const mapped = rows.slice(0, limit).map((r) => ({
       id: Number(r.id),
       order_code: Number(r.order_code),
       order_date: r.order_date ?? null,
       current_status: r.current_status ?? null,
       total_amount: r.total_amount ?? null,
       marketplace_name: r.marketplace_name ?? null,
+      channel: r.channel ?? null,
       customer: r.customer_id
         ? {
             id: Number(r.customer_id),
-            name: r.customer_trade_name ?? r.customer_legal_name ?? null,
+            name: r.customer_name ?? null,
             email: r.customer_email ?? null,
             tax_id: r.customer_tax_id ?? null,
           }
         : null,
-    })),
-  );
+    }));
+  const hasMore = rows.length > limit;
+
+  return res.json({ page, limit, hasMore, rows: mapped });
 });
 
 companiesRouter.get('/me/orders/:id', async (req: Request, res: Response) => {
@@ -2157,13 +3929,23 @@ companiesRouter.get('/me/products', async (req: Request, res: Response) => {
   if (!companyId) return res.status(400).json({ message: 'Company not configured for this user' });
 
   const q = String((req.query as any)?.q ?? '').trim();
+  const field = String((req.query as any)?.field ?? '').trim().toLowerCase();
+  const value = String((req.query as any)?.value ?? '').trim();
   const limitRaw = Number((req.query as any)?.limit ?? 50);
   const limit = Number.isInteger(limitRaw) ? Math.min(Math.max(limitRaw, 1), 200) : 50;
 
   const repo = AppDataSource.getRepository(Products);
   const qb = repo.createQueryBuilder('p').where('p.company_id = :companyId', { companyId });
 
-  if (q) {
+  const allowedFields = new Set(['sku', 'brand', 'category', 'subcategory', 'final_category']);
+  if (field && value && allowedFields.has(field)) {
+    const v = `%${value}%`;
+    if (field === 'sku') qb.andWhere(`CAST(p.sku AS text) ILIKE :v`, { v });
+    else if (field === 'brand') qb.andWhere(`p.brand ILIKE :v`, { v });
+    else if (field === 'category') qb.andWhere(`p.category ILIKE :v`, { v });
+    else if (field === 'subcategory') qb.andWhere(`p.subcategory ILIKE :v`, { v });
+    else if (field === 'final_category') qb.andWhere(`p.final_category ILIKE :v`, { v });
+  } else if (q) {
     qb.andWhere(
       `(CAST(p.sku AS text) ILIKE :q OR p.name ILIKE :q OR p.ean ILIKE :q OR p.slug ILIKE :q OR p.external_reference ILIKE :q OR p.store_reference ILIKE :q)`,
       { q: `%${q}%` },
@@ -2183,11 +3965,349 @@ companiesRouter.get('/me/products', async (req: Request, res: Response) => {
       ean: p.ean ?? null,
       brand: p.brand ?? null,
       model: p.model ?? null,
-      category: p.final_category ?? p.category ?? null,
+      category: (p as any).category ?? null,
+      subcategory: (p as any).subcategory ?? null,
+      final_category: (p as any).final_category ?? null,
       photo: p.photo ?? null,
       url: p.url ?? null,
     })),
   );
+});
+
+companiesRouter.get('/me/products/distinct-values', async (req: Request, res: Response) => {
+  const userId = await getAuthUserId(req);
+  if (!userId) return res.status(401).json({ message: 'Não autenticado' });
+  const companyId = await getAuthCompanyId(req);
+  if (!companyId) return res.status(400).json({ message: 'Company not configured for this user' });
+
+  const rows = await AppDataSource.query(
+    `
+    SELECT
+      ARRAY(
+        SELECT DISTINCT TRIM(p.brand)
+        FROM products p
+        WHERE p.company_id = $1 AND p.brand IS NOT NULL AND TRIM(p.brand) <> ''
+        ORDER BY 1
+        LIMIT 500
+      ) AS brands,
+      ARRAY(
+        SELECT DISTINCT TRIM(p.model)
+        FROM products p
+        WHERE p.company_id = $1 AND p.model IS NOT NULL AND TRIM(p.model) <> ''
+        ORDER BY 1
+        LIMIT 500
+      ) AS models,
+      ARRAY(
+        SELECT DISTINCT TRIM(p.category)
+        FROM products p
+        WHERE p.company_id = $1 AND p.category IS NOT NULL AND TRIM(p.category) <> ''
+        ORDER BY 1
+        LIMIT 500
+      ) AS categories,
+      ARRAY(
+        SELECT DISTINCT TRIM(p.subcategory)
+        FROM products p
+        WHERE p.company_id = $1 AND p.subcategory IS NOT NULL AND TRIM(p.subcategory) <> ''
+        ORDER BY 1
+        LIMIT 700
+      ) AS subcategories,
+      ARRAY(
+        SELECT DISTINCT TRIM(p.final_category)
+        FROM products p
+        WHERE p.company_id = $1 AND p.final_category IS NOT NULL AND TRIM(p.final_category) <> ''
+        ORDER BY 1
+        LIMIT 900
+      ) AS final_categories
+    `,
+    [companyId],
+  );
+
+  const r = rows?.[0] || {};
+  return res.json({
+    brands: r.brands ?? [],
+    models: r.models ?? [],
+    categories: r.categories ?? [],
+    subcategories: r.subcategories ?? [],
+    finalCategories: r.final_categories ?? [],
+  });
+});
+
+companiesRouter.get('/me/products/marketplace-status', async (req: Request, res: Response) => {
+  const userId = await getAuthUserId(req);
+  if (!userId) return res.status(401).json({ message: 'Não autenticado' });
+  const companyId = await getAuthCompanyId(req);
+  if (!companyId) return res.status(400).json({ message: 'Company not configured for this user' });
+
+  const q = String((req.query as any)?.q ?? '').trim();
+  const field = String((req.query as any)?.field ?? '').trim().toLowerCase();
+  const value = String((req.query as any)?.value ?? '').trim();
+  const limitRaw = Number((req.query as any)?.limit ?? 50);
+  const limit = Number.isInteger(limitRaw) ? Math.min(Math.max(limitRaw, 1), 200) : 50;
+
+  const repo = AppDataSource.getRepository(Products);
+  const qb = repo.createQueryBuilder('p').where('p.company_id = :companyId', { companyId });
+
+  const allowedFields = new Set(['sku', 'brand', 'category', 'subcategory', 'final_category']);
+  if (field && value && allowedFields.has(field)) {
+    const v = `%${value}%`;
+    if (field === 'sku') qb.andWhere(`CAST(p.sku AS text) ILIKE :v`, { v });
+    else if (field === 'brand') qb.andWhere(`p.brand ILIKE :v`, { v });
+    else if (field === 'category') qb.andWhere(`p.category ILIKE :v`, { v });
+    else if (field === 'subcategory') qb.andWhere(`p.subcategory ILIKE :v`, { v });
+    else if (field === 'final_category') qb.andWhere(`p.final_category ILIKE :v`, { v });
+  } else if (q) {
+    qb.andWhere(
+      `(CAST(p.sku AS text) ILIKE :q OR p.name ILIKE :q OR p.ean ILIKE :q OR p.slug ILIKE :q OR p.external_reference ILIKE :q OR p.store_reference ILIKE :q)`,
+      { q: `%${q}%` },
+    );
+  }
+
+  const products = await qb.orderBy('p.id', 'DESC').limit(limit).getMany();
+  const productIds = products.map((p) => p.id).filter((id) => Number.isInteger(id) && id > 0);
+
+  if (!productIds.length) return res.json({ marketplaces: [], rows: [] });
+
+  const marketplacesRows = await AppDataSource.query(
+    `
+    SELECT DISTINCT
+      COALESCE(NULLIF(TRIM(o.marketplace_name), ''), NULLIF(TRIM(o.channel), '')) AS marketplace
+    FROM orders o
+    WHERE o.company_id = $1
+      AND COALESCE(NULLIF(TRIM(o.marketplace_name), ''), NULLIF(TRIM(o.channel), '')) IS NOT NULL
+    ORDER BY 1
+    LIMIT 50
+    `,
+    [companyId],
+  );
+  const marketplaces = (marketplacesRows || [])
+    .map((r: any) => String(r.marketplace ?? '').trim())
+    .filter((s: string) => s.length > 0);
+
+  const statusRows = await AppDataSource.query(
+    `
+    SELECT
+      i.product_id::int AS product_id,
+      COALESCE(NULLIF(TRIM(o.marketplace_name), ''), NULLIF(TRIM(o.channel), '')) AS marketplace,
+      ((now() AT TIME ZONE 'America/Sao_Paulo')::date - MAX(o.order_date::date))::int AS days_without_sales
+    FROM orders o
+    JOIN order_items i ON i.order_id = o.id
+    WHERE o.company_id = $1
+      AND i.product_id = ANY($2::int[])
+      AND COALESCE(NULLIF(TRIM(o.marketplace_name), ''), NULLIF(TRIM(o.channel), '')) IS NOT NULL
+    GROUP BY i.product_id, marketplace
+    `,
+    [companyId, productIds],
+  );
+
+  const byProduct = new Map<number, Record<string, number>>();
+  for (const r of statusRows || []) {
+    const pid = Number(r.product_id ?? 0) || 0;
+    const mk = String(r.marketplace ?? '').trim();
+    const days = Number(r.days_without_sales ?? null);
+    if (!pid || !mk || !Number.isFinite(days)) continue;
+    const cur = byProduct.get(pid) ?? {};
+    cur[mk] = days;
+    byProduct.set(pid, cur);
+  }
+
+  return res.json({
+    marketplaces,
+    rows: products.map((p) => ({
+      id: p.id,
+      sku: p.sku,
+      name: p.name ?? null,
+      photo: p.photo ?? null,
+      status: byProduct.get(p.id) ?? {},
+    })),
+  });
+});
+
+companiesRouter.post('/me/products/classify-ai', async (req: Request, res: Response) => {
+  const userId = await getAuthUserId(req);
+  if (!userId) return res.status(401).json({ message: 'Não autenticado' });
+  const companyId = await getAuthCompanyId(req);
+  if (!companyId) return res.status(400).json({ message: 'Company not configured for this user' });
+
+  const key = String(process.env.OPENAI_API_KEY ?? '').trim();
+  if (!key) return res.status(500).json({ message: 'OPENAI_API_KEY não configurada no servidor.' });
+
+  const body = (req.body ?? {}) as any;
+  const idsRaw = Array.isArray(body?.ids) ? body.ids : [];
+  const ids = idsRaw
+    .map((x: any) => Number(x))
+    .filter((n: number) => Number.isInteger(n) && n > 0);
+  if (!ids.length) return res.status(400).json({ message: 'ids obrigatório (lista de inteiros positivos).' });
+
+  const prompt = loadPromptFile(path.join('prompt', 'classificar.md'));
+
+  // base de categorias existentes (cap para não explodir tokens)
+  const existing = await AppDataSource.query(
+    `
+    SELECT
+      ARRAY(SELECT DISTINCT TRIM(p.category) FROM products p WHERE p.company_id = $1 AND p.category IS NOT NULL AND TRIM(p.category) <> '' ORDER BY 1 LIMIT 300) AS categories,
+      ARRAY(SELECT DISTINCT TRIM(p.subcategory) FROM products p WHERE p.company_id = $1 AND p.subcategory IS NOT NULL AND TRIM(p.subcategory) <> '' ORDER BY 1 LIMIT 400) AS subcategories,
+      ARRAY(SELECT DISTINCT TRIM(p.final_category) FROM products p WHERE p.company_id = $1 AND p.final_category IS NOT NULL AND TRIM(p.final_category) <> '' ORDER BY 1 LIMIT 600) AS final_categories
+    `,
+    [companyId],
+  );
+  const existingObj = existing?.[0] || {};
+
+  const candidates = await AppDataSource.getRepository(Products)
+    .createQueryBuilder('p')
+    .where('p.company_id = :companyId', { companyId })
+    .andWhere('p.id = ANY(:ids)', { ids })
+    .andWhere(
+      `(
+        p.category IS NULL OR TRIM(p.category) = '' OR
+        p.subcategory IS NULL OR TRIM(p.subcategory) = '' OR
+        p.final_category IS NULL OR TRIM(p.final_category) = ''
+      )`,
+    )
+    .orderBy('p.id', 'DESC')
+    .getMany();
+  if (!candidates.length) {
+    return res.json({
+      ok: true,
+      processed: 0,
+      updated: 0,
+      batches: 0,
+      message: 'Nenhum dos itens selecionados precisa de classificação (categoria/subcategoria/categoria final já preenchidos).',
+    });
+  }
+
+  type ItemIn = {
+    sku: string;
+    name: string;
+    categoria: string | null;
+    subcategoria: string | null;
+    categoria_final: string | null;
+  };
+
+  const itemsAll: ItemIn[] = candidates.map((p) => ({
+    sku: String(p.sku ?? ''),
+    name: String(p.name ?? ''),
+    categoria: safeTrimOrNull((p as any).category),
+    subcategoria: safeTrimOrNull((p as any).subcategory),
+    categoria_final: safeTrimOrNull((p as any).final_category),
+  }));
+
+  const productBySku = new Map<string, Products>();
+  for (const p of candidates) productBySku.set(String(p.sku ?? ''), p);
+
+  const BATCH = 20;
+  const batches: ItemIn[][] = [];
+  for (let i = 0; i < itemsAll.length; i += BATCH) batches.push(itemsAll.slice(i, i + BATCH));
+
+  let updated = 0;
+  const errors: any[] = [];
+
+  for (let bi = 0; bi < batches.length; bi++) {
+    const batch = batches[bi];
+    const userPayload = {
+      existing: {
+        categories: existingObj.categories ?? [],
+        subcategories: existingObj.subcategories ?? [],
+        final_categories: existingObj.final_categories ?? [],
+      },
+      items: batch,
+    };
+
+    const openaiResp = await fetch('https://api.openai.com/v1/responses', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${key}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'gpt-4.1',
+        temperature: 0.2,
+        max_output_tokens: 2500,
+        input: [
+          { role: 'system', content: prompt },
+          {
+            role: 'user',
+            content:
+              `Classifique os itens abaixo.\n` +
+              `Responda SOMENTE com um JSON (sem markdown) no formato:\n` +
+              `{"items":[{"sku","name","categoria","subcategoria","categoria_final"}]}\n` +
+              `- Não altere sku nem name.\n` +
+              `- Só preencha campos que estiverem null/vazio.\n\n` +
+              JSON.stringify(userPayload),
+          },
+        ],
+      }),
+    });
+
+    const raw = await openaiResp.json().catch(() => ({}));
+    if (!openaiResp.ok) {
+      errors.push({ batch: bi, message: 'Erro OpenAI', status: openaiResp.status, payload: raw });
+      continue;
+    }
+
+    const text = extractOpenAIText(raw);
+    let parsed: any = null;
+    try {
+      parsed = extractJsonFromText(text);
+    } catch (e: any) {
+      errors.push({ batch: bi, message: 'Resposta não é JSON válido', detail: String(e?.message || e), text: String(text).slice(0, 1200) });
+      continue;
+    }
+
+    const outItems = Array.isArray((parsed as any)?.items) ? (parsed as any).items : Array.isArray(parsed) ? parsed : null;
+    if (!outItems) {
+      errors.push({ batch: bi, message: 'JSON sem items (formato inesperado)', parsed });
+      continue;
+    }
+
+    const outMap = new Map<string, any>();
+    for (const it of outItems) {
+      const sku = safeTrimOrNull(it?.sku);
+      if (sku) outMap.set(sku, it);
+    }
+
+    for (const original of batch) {
+      const it = outMap.get(original.sku);
+      if (!it) continue;
+      const nextCategoria = safeTrimOrNull(it?.categoria);
+      const nextSub = safeTrimOrNull(it?.subcategoria);
+      const nextFinal = safeTrimOrNull(it?.categoria_final);
+
+      // aplica apenas em campos vazios
+      const updateSet: any = {};
+      const current = productBySku.get(original.sku);
+      if (!current) continue;
+
+      const curCat = safeTrimOrNull((current as any).category);
+      const curSub = safeTrimOrNull((current as any).subcategory);
+      const curFinal = safeTrimOrNull((current as any).final_category);
+
+      if (!curCat && nextCategoria) updateSet.category = nextCategoria;
+      if (!curSub && nextSub) updateSet.subcategory = nextSub;
+      if (!curFinal && nextFinal) updateSet.final_category = nextFinal;
+
+      const hasAny = Object.keys(updateSet).length > 0;
+      if (!hasAny) continue;
+
+      updateSet.manual_attributes_locked = true;
+
+      const result = await AppDataSource.createQueryBuilder()
+        .update(Products)
+        .set(updateSet)
+        .where('company_id = :companyId', { companyId })
+        .andWhere('id = :id', { id: current.id })
+        .execute();
+
+      if ((result.affected ?? 0) > 0) updated += 1;
+    }
+  }
+
+  return res.json({
+    ok: true,
+    processed: candidates.length,
+    updated,
+    batches: batches.length,
+    errors,
+  });
 });
 
 companiesRouter.get('/me/products/:id', async (req: Request, res: Response) => {
@@ -2228,6 +4348,58 @@ companiesRouter.get('/me/products/:id', async (req: Request, res: Response) => {
     url: product.url ?? null,
     raw: product.raw ?? null,
   });
+});
+
+companiesRouter.put('/me/products/bulk-update', async (req: Request, res: Response) => {
+  const userId = await getAuthUserId(req);
+  if (!userId) return res.status(401).json({ message: 'Não autenticado' });
+  const companyId = await getAuthCompanyId(req);
+  if (!companyId) return res.status(400).json({ message: 'Company not configured for this user' });
+
+  const body = (req.body ?? {}) as any;
+  const idsRaw = Array.isArray(body.ids) ? body.ids : [];
+  const ids = idsRaw
+    .map((x: any) => Number(x))
+    .filter((n: number) => Number.isInteger(n) && n > 0);
+  if (!ids.length) return res.status(400).json({ message: 'ids obrigatório (lista de inteiros positivos).' });
+
+  const fields = (body.fields ?? {}) as Record<string, any>;
+  const next: Partial<Products> & Record<string, any> = {};
+
+  const pickNullableString = (v: any): string | null | undefined => {
+    if (v === undefined) return undefined;
+    if (v === null) return null;
+    const s = String(v).trim();
+    return s ? s : null;
+  };
+
+  const brand = pickNullableString(fields.brand);
+  const model = pickNullableString(fields.model);
+  const category = pickNullableString(fields.category);
+  const subcategory = pickNullableString(fields.subcategory);
+  const finalCategory = pickNullableString(fields.final_category);
+
+  if (brand !== undefined) next.brand = brand;
+  if (model !== undefined) next.model = model;
+  if (category !== undefined) next.category = category;
+  if (subcategory !== undefined) next.subcategory = subcategory;
+  if (finalCategory !== undefined) next.final_category = finalCategory;
+
+  const lock = body.lock === undefined ? true : Boolean(body.lock);
+  if (lock) next.manual_attributes_locked = true;
+
+  const hasAnyField =
+    brand !== undefined || model !== undefined || category !== undefined || subcategory !== undefined || finalCategory !== undefined;
+  if (!hasAnyField && !lock) return res.status(400).json({ message: 'Nenhuma alteração informada.' });
+
+  const result = await AppDataSource.createQueryBuilder()
+    .update(Products)
+    .set(next)
+    .where('company_id = :companyId', { companyId })
+    .andWhere('id = ANY(:ids)', { ids })
+    .execute();
+
+  return res.json({ ok: true, affected: result.affected ?? 0 });
 });
 
 companiesRouter.get('/me/platforms', async (req: Request, res: Response) => {

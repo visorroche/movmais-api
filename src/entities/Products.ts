@@ -73,6 +73,10 @@ export class Products {
   @Column({ type: 'varchar', nullable: true })
   final_category?: string | null;
 
+  // Quando TRUE, integrações (script-bi) não devem sobrescrever category/subcategory/final_category/brand/model
+  @Column({ type: 'boolean', default: false })
+  manual_attributes_locked!: boolean;
+
   @Column({ type: 'varchar', nullable: true })
   photo?: string | null;
 
