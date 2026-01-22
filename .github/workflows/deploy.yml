@@ -62,64 +62,57 @@ jobs:
             head -5 package.json
             echo ""
 
-                                    echo "=========================================="
+                                                echo "=========================================="
             echo "📝 CRIAR ARQUIVO .ENV DINÂMICO"
             echo "=========================================="
             
             cd /opt/movmais/apps/api
             
-            # Criar script temporário para gerar o .env
-            cat > generate_env.py << 'PYEOF'
-import os
-
-# Mapeamento de secrets passados pelo GitHub
-secrets = {
-    "PORT": "${{ secrets.PORT }}",
-    "CORS_ORIGINS": "${{ secrets.CORS_ORIGINS }}",
-    "CORS_HEADERS": "${{ secrets.CORS_HEADERS }}",
-    "CORS_METHODS": "${{ secrets.CORS_METHODS }}",
-    "DB_HOST": "${{ secrets.DB_HOST }}",
-    "DB_PORT": "${{ secrets.DB_PORT }}",
-    "DB_USER": "${{ secrets.DB_USER }}",
-    "DB_PASS": "${{ secrets.DB_PASS }}",
-    "DB_NAME": "${{ secrets.DB_NAME }}",
-    "JWT_SECRET": "${{ secrets.JWT_SECRET }}",
-    "OPENAI_API_KEY": "${{ secrets.OPENAI_API_KEY }}",
-    "SCRIPT_BI_SCHEDULER_URL": "${{ secrets.SCRIPT_BI_SCHEDULER_URL }}",
-    "SCRIPT_BI_SCHEDULER_RUN_TOKEN": "${{ secrets.SCRIPT_BI_SCHEDULER_RUN_TOKEN }}"
-}
-
-env_content = []
-with open(".env.example", "r") as f:
-    for line in f:
-        line = line.strip()
-        if not line or line.startswith("#"):
-            env_content.append(line)
-            continue
-        
-        key = line.split("=")[0].strip()
-        if key in secrets and secrets[key]:
-            env_content.append(f"{key}={secrets[key]}")
-        else:
-            env_content.append(line)
-
-# Adicionar fixos
-env_content.append("NODE_ENV=production")
-env_content.append("DB_SSL=true")
-
-with open(".env", "w") as f:
-    f.write("
-".join(env_content) + "
-")
-
-print("✅ .env gerado com sucesso")
-PYEOF
+            # Criar .env limpo
+            > .env
             
-            python3 generate_env.py
-            rm generate_env.py
+            # Lista de variáveis que queremos injetar (devem estar no bloco 'envs' do workflow)
+            VARS=("PORT" "CORS_ORIGINS" "CORS_HEADERS" "CORS_METHODS" "DB_HOST" "DB_PORT" "DB_USER" "DB_PASS" "DB_NAME" "JWT_SECRET" "OPENAI_API_KEY" "SCRIPT_BI_SCHEDULER_URL" "SCRIPT_BI_SCHEDULER_RUN_TOKEN")
+            
+            # Ler .env.example
+            while IFS='=' read -r key value || [ -n "$key" ]; do
+              # Ignorar comentários e linhas vazias
+              if [[ $key =~ ^#.* ]] || [[ -z $key ]]; then
+                echo "$key" >> .env
+                continue
+              fi
+              
+              var_name=$(echo $key | xargs)
+              
+              # Verificar se a variável está na nossa lista de injeção
+              is_secret=false
+              for v in "${VARS[@]}"; do
+                if [ "$v" == "$var_name" ]; then
+                  is_secret=true
+                  break
+                fi
+              done
+              
+              if [ "$is_secret" = true ]; then
+                # Pegar o valor da variável de ambiente (passada pelo appleboy/ssh-action)
+                val=$(eval echo \$$var_name)
+                if [ -n "$val" ]; then
+                  echo "Injetando $var_name"
+                  echo "$var_name=$val" >> .env
+                else
+                  echo "⚠️ $var_name vazio, usando default"
+                  echo "$key=$value" >> .env
+                fi
+              else
+                echo "$key=$value" >> .env
+              fi
+            done < .env.example
+            
+            echo "NODE_ENV=production" >> .env
+            echo "DB_SSL=true" >> .env
             
             echo "✅ Arquivo .env atualizado dinamicamente"
-            echo ""  
+            echo ""   
             echo ""
             
             # Debug: mostrar variáveis injetadas
