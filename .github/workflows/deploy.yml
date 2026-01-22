@@ -62,39 +62,43 @@ jobs:
             head -5 package.json
             echo ""
 
+                        echo "=========================================="
+            echo "📝 CRIAR ARQUIVO .ENV DINÂMICO"
             echo "=========================================="
-            echo "📝 CRIAR ARQUIVO .ENV COM SECRETS"
-            echo "=========================================="
             
-            # Criar arquivo .env com secrets usando sed
-            cat > /tmp/env_template.txt << 'EOF'
-            DB_HOST=__DB_HOST__
-            DB_PORT=__DB_PORT__
-            DB_USER=__DB_USER__
-            DB_PASS=__DB_PASS__
-            DB_NAME=__DB_NAME__
-            DB_SSL=true
-            JWT_SECRET=__JWT_SECRET__
-            CORS_METHODS=__CORS_METHODS__
-            CORS_HEADERS=__CORS_HEADERS__
-            CORS_ORIGINS=__CORS_ORIGINS__
-            NODE_ENV=production
-            EOF
+            cd /opt/movmais/apps/api
             
-            # Substituir os placeholders com os valores dos secrets
-            sed -e 's|__DB_HOST__|${{ secrets.DB_HOST }}|g' \
-                -e 's|__DB_PORT__|${{ secrets.DB_PORT }}|g' \
-                -e 's|__DB_USER__|${{ secrets.DB_USER }}|g' \
-                -e 's|__DB_PASS__|${{ secrets.DB_PASS }}|g' \
-                -e 's|__DB_NAME__|${{ secrets.DB_NAME }}|g' \
-                -e 's|__JWT_SECRET__|${{ secrets.JWT_SECRET }}|g' \
-                -e 's|__CORS_METHODS__|${{ secrets.CORS_METHODS }}|g' \
-                -e 's|__CORS_HEADERS__|${{ secrets.CORS_HEADERS }}|g' \
-                -e 's|__CORS_ORIGINS__|${{ secrets.CORS_ORIGINS }}|g' \
-                /tmp/env_template.txt > /opt/movmais/apps/api/.env
-            echo "NODE_ENV=production" >> /opt/movmais/apps/api/.env
+            # Criar .env limpo
+            > .env
             
-            echo "✅ Arquivo .env criado com secrets do GitHub"
+            # Ler .env.example e para cada variável, buscar no ambiente
+            while IFS='=' read -r key value || [ -n "$key" ]; do
+              # Ignorar comentários e linhas vazias
+              if [[ $key =~ ^#.* ]] || [[ -z $key ]]; then
+                continue
+              fi
+              
+              # Pegar apenas o nome da chave
+              var_name=$(echo $key | xargs)
+              
+              # Buscar o valor da variável de ambiente (passada pelo GitHub Actions)
+              # Se não existir no ambiente, mantém o valor do .env.example (opcional)
+              eval var_value=\$$var_name
+              
+              if [ -n "$var_value" ]; then
+                echo "Injetando $var_name"
+                echo "$var_name=$var_value" >> .env
+              else
+                echo "⚠️ $var_name não encontrado nos secrets, usando valor default"
+                echo "$key=$value" >> .env
+              fi
+            done < .env.example
+            
+            echo "NODE_ENV=production" >> .env
+            echo "DB_SSL=true" >> .env
+            
+            echo "✅ Arquivo .env atualizado dinamicamente"
+            echo "" 
             echo ""
             
             # Debug: mostrar variáveis injetadas
