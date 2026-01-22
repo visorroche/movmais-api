@@ -64,7 +64,7 @@ jobs:
             head -5 package.json
             echo ""
 
-                                                                                    echo "=========================================="
+                                                                                                echo "=========================================="
             echo "📝 CRIAR ARQUIVO .ENV DINÂMICO"
             echo "=========================================="
             
@@ -108,7 +108,7 @@ PYEOF
             rm generate_env.py
             
             echo "✅ Arquivo .env atualizado com Python (via ENV)"
-            echo ""      
+            echo ""       
             echo ""
             
             # Debug: mostrar variáveis injetadas
