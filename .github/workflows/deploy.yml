@@ -63,36 +63,57 @@ jobs:
             head -5 package.json
             echo ""
 
-                                                            echo "=========================================="
+                                                                        echo "=========================================="
             echo "📝 CRIAR ARQUIVO .ENV DINÂMICO"
             echo "=========================================="
             
             cd /opt/movmais/apps/api
             
-            # Criar .env a partir do .env.example
-            cp .env.example .env
+            # Criar script Python para gerar o .env com segurança
+            cat << 'PYEOF' > generate_env.py
+import sys
+
+secrets = {
+    "PORT": """${{ secrets.PORT }}""",
+    "CORS_ORIGINS": """${{ secrets.CORS_ORIGINS }}""",
+    "CORS_HEADERS": """${{ secrets.CORS_HEADERS }}""",
+    "CORS_METHODS": """${{ secrets.CORS_METHODS }}""",
+    "DB_HOST": """${{ secrets.DB_HOST }}""",
+    "DB_PORT": """${{ secrets.DB_PORT }}""",
+    "DB_USER": """${{ secrets.DB_USER }}""",
+    "DB_PASS": """${{ secrets.DB_PASS }}""",
+    "DB_NAME": """${{ secrets.DB_NAME }}""",
+    "JWT_SECRET": """${{ secrets.JWT_SECRET }}""",
+    "OPENAI_API_KEY": """${{ secrets.OPENAI_API_KEY }}""",
+    "SCRIPT_BI_SCHEDULER_URL": """${{ secrets.SCRIPT_BI_SCHEDULER_URL }}""",
+    "SCRIPT_BI_SCHEDULER_RUN_TOKEN": """${{ secrets.SCRIPT_BI_SCHEDULER_RUN_TOKEN }}"""
+}
+
+with open(".env.example", "r") as f:
+    lines = f.readlines()
+
+with open(".env", "w") as f:
+    for line in lines:
+        if "=" in line and not line.startswith("#"):
+            key = line.split("=")[0].strip()
+            if key in secrets and secrets[key]:
+                f.write(f"{key}={secrets[key]}
+")
+            else:
+                f.write(line)
+        else:
+            f.write(line)
+    f.write("NODE_ENV=production
+")
+    f.write("DB_SSL=true
+")
+PYEOF
             
-            # Substituir cada variável usando sed
-            # O GitHub Actions substituirá as variáveis ${{ secrets.XXX }} antes de enviar o script
-            sed -i "s|^PORT=.*|PORT=${{ secrets.PORT }}|" .env
-            sed -i "s|^CORS_ORIGINS=.*|CORS_ORIGINS=${{ secrets.CORS_ORIGINS }}|" .env
-            sed -i "s|^CORS_HEADERS=.*|CORS_HEADERS=${{ secrets.CORS_HEADERS }}|" .env
-            sed -i "s|^CORS_METHODS=.*|CORS_METHODS=${{ secrets.CORS_METHODS }}|" .env
-            sed -i "s|^DB_HOST=.*|DB_HOST=${{ secrets.DB_HOST }}|" .env
-            sed -i "s|^DB_PORT=.*|DB_PORT=${{ secrets.DB_PORT }}|" .env
-            sed -i "s|^DB_USER=.*|DB_USER=${{ secrets.DB_USER }}|" .env
-            sed -i "s|^DB_PASS=.*|DB_PASS=${{ secrets.DB_PASS }}|" .env
-            sed -i "s|^DB_NAME=.*|DB_NAME=${{ secrets.DB_NAME }}|" .env
-            sed -i "s|^JWT_SECRET=.*|JWT_SECRET=${{ secrets.JWT_SECRET }}|" .env
-            sed -i "s|^OPENAI_API_KEY=.*|OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}|" .env
-            sed -i "s|^SCRIPT_BI_SCHEDULER_URL=.*|SCRIPT_BI_SCHEDULER_URL=${{ secrets.SCRIPT_BI_SCHEDULER_URL }}|" .env
-            sed -i "s|^SCRIPT_BI_SCHEDULER_RUN_TOKEN=.*|SCRIPT_BI_SCHEDULER_RUN_TOKEN=${{ secrets.SCRIPT_BI_SCHEDULER_RUN_TOKEN }}|" .env
+            python3 generate_env.py
+            rm generate_env.py
             
-            echo "NODE_ENV=production" >> .env
-            echo "DB_SSL=true" >> .env
-            
-            echo "✅ Arquivo .env atualizado com sed"
-            echo ""    
+            echo "✅ Arquivo .env atualizado com Python"
+            echo ""     
             echo ""
             
             # Debug: mostrar variáveis injetadas
