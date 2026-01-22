@@ -351,6 +351,7 @@ companiesRouter.get('/me/integration-logs', async (req: Request, res: Response) 
       l.id,
       l.processed_at,
       l.date,
+      l.status,
       l.company_id,
       c.name AS company_name,
       l.platform_id,
@@ -370,6 +371,107 @@ companiesRouter.get('/me/integration-logs', async (req: Request, res: Response) 
   );
 
   return res.json({ total, items: rows });
+});
+
+// Dispara execução forçada via script-bi/scheduler (assíncrono: responde "iniciado")
+companiesRouter.post('/me/integration-run', async (req: Request, res: Response) => {
+  const userId = await getAuthUserId(req);
+  if (!userId) return res.status(401).json({ message: 'Não autenticado' });
+
+  const filter = await getAuthCompanyGroupFilter(req);
+  if (!filter) return res.status(400).json({ message: 'Company not configured for this user' });
+
+  const { companyId: authCompanyId, groupId } = filter;
+  if (groupId) {
+    // Por segurança: no escopo de grupo, exigir que a UI mande explicitamente company_id e validar que pertence ao grupo.
+    // Aqui mantemos simples e bloqueamos até implementarmos checagem de grupo->company.
+    return res.status(403).json({ message: 'Ação não permitida no escopo de grupo (selecione uma empresa específica).' });
+  }
+
+  const body = (req.body ?? {}) as any;
+  const platform = String(body?.platform ?? body?.plataform ?? '').trim();
+  const script = String(body?.script ?? '').trim();
+  const companyId = authCompanyId;
+  const startDate = body?.start_date ? String(body.start_date).trim() : null;
+  const endDate = body?.end_date ? String(body.end_date).trim() : null;
+  const onlyInsert = Boolean(body?.only_insert ?? body?.onlyInsert);
+
+  if (!platform) return res.status(400).json({ message: 'platform obrigatório.' });
+  if (!script) return res.status(400).json({ message: 'script obrigatório.' });
+  if (!Number.isInteger(companyId) || companyId <= 0) return res.status(400).json({ message: 'Company inválida.' });
+
+  const isYmd = (s: string) => /^\d{4}-\d{2}-\d{2}$/.test(s);
+  if (startDate && !isYmd(startDate)) return res.status(400).json({ message: 'start_date inválido (YYYY-MM-DD).' });
+  if (endDate && !isYmd(endDate)) return res.status(400).json({ message: 'end_date inválido (YYYY-MM-DD).' });
+
+  // Valida se a plataforma está configurada na company atual
+  const configured = await AppDataSource.getRepository(CompanyPlatforms).find({
+    where: { company_id: companyId } as any,
+    relations: { platform: true },
+  });
+  const allowedPlatformSlugs = new Set(
+    configured
+      .map((cp) => (cp.platform as any)?.slug)
+      .filter((s) => typeof s === 'string' && s.trim())
+      .map((s) => String(s).trim()),
+  );
+  if (!allowedPlatformSlugs.has(platform)) {
+    return res.status(403).json({ message: 'Plataforma não configurada para esta empresa.' });
+  }
+
+  const ALLOWED_SCRIPTS: Record<string, Set<string>> = {
+    allpost: new Set(['quotes', 'orders']),
+    precode: new Set(['orders', 'products']),
+    tray: new Set(['orders', 'products']),
+  };
+  if (!ALLOWED_SCRIPTS[platform]?.has(script)) {
+    return res.status(400).json({ message: 'Script inválido para esta plataforma.' });
+  }
+
+  const schedulerUrl = String(process.env.SCRIPT_BI_SCHEDULER_URL ?? '').trim(); // ex: http://localhost:3000
+  if (!schedulerUrl) return res.status(500).json({ message: 'SCRIPT_BI_SCHEDULER_URL não configurada no servidor.' });
+  const runToken = String(process.env.SCRIPT_BI_SCHEDULER_RUN_TOKEN ?? '').trim();
+
+  const payload = {
+    platform,
+    script,
+    company_id: companyId,
+    start_date: startDate ?? undefined,
+    end_date: endDate ?? undefined,
+    only_insert: onlyInsert || undefined,
+  };
+
+  try {
+    const resp = await fetch(`${schedulerUrl.replace(/\/+$/, '')}/run-script`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(runToken ? { 'x-run-token': runToken } : {}),
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const text = await resp.text().catch(() => '');
+    const json = (() => {
+      try {
+        return text ? JSON.parse(text) : null;
+      } catch {
+        return null;
+      }
+    })();
+
+    if (!resp.ok) {
+      return res.status(502).json({
+        message: 'Falha ao iniciar script no scheduler.',
+        scheduler_status: resp.status,
+        scheduler_response: json ?? text,
+      });
+    }
+
+    return res.status(202).json({ ok: true, message: 'script iniciado', scheduler: json ?? null });
+  } catch (e: any) {
+    return res.status(502).json({ message: 'Erro ao conectar no scheduler.', error: String(e?.message ?? e) });
+  }
 });
 
 companiesRouter.get('/me/dashboard/products', async (req: Request, res: Response) => {
