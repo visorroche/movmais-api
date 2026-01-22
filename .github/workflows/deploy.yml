@@ -17,6 +17,7 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.DEPLOY_KEY }}
 
+          envs: PORT,CORS_ORIGINS,CORS_HEADERS,CORS_METHODS,DB_HOST,DB_PORT,DB_USER,DB_PASS,DB_NAME,JWT_SECRET,OPENAI_API_KEY,SCRIPT_BI_SCHEDULER_URL,SCRIPT_BI_SCHEDULER_RUN_TOKEN
           script: |
             echo "=========================================="
             echo "🚀 INICIANDO DEPLOY DA API"
@@ -63,31 +64,23 @@ jobs:
             head -5 package.json
             echo ""
 
-                                                                        echo "=========================================="
+                                                                                    echo "=========================================="
             echo "📝 CRIAR ARQUIVO .ENV DINÂMICO"
             echo "=========================================="
             
             cd /opt/movmais/apps/api
             
-            # Criar script Python para gerar o .env com segurança
+            # Criar script Python para gerar o .env a partir das variáveis de ambiente
             cat << 'PYEOF' > generate_env.py
-import sys
+import os
 
-secrets = {
-    "PORT": """${{ secrets.PORT }}""",
-    "CORS_ORIGINS": """${{ secrets.CORS_ORIGINS }}""",
-    "CORS_HEADERS": """${{ secrets.CORS_HEADERS }}""",
-    "CORS_METHODS": """${{ secrets.CORS_METHODS }}""",
-    "DB_HOST": """${{ secrets.DB_HOST }}""",
-    "DB_PORT": """${{ secrets.DB_PORT }}""",
-    "DB_USER": """${{ secrets.DB_USER }}""",
-    "DB_PASS": """${{ secrets.DB_PASS }}""",
-    "DB_NAME": """${{ secrets.DB_NAME }}""",
-    "JWT_SECRET": """${{ secrets.JWT_SECRET }}""",
-    "OPENAI_API_KEY": """${{ secrets.OPENAI_API_KEY }}""",
-    "SCRIPT_BI_SCHEDULER_URL": """${{ secrets.SCRIPT_BI_SCHEDULER_URL }}""",
-    "SCRIPT_BI_SCHEDULER_RUN_TOKEN": """${{ secrets.SCRIPT_BI_SCHEDULER_RUN_TOKEN }}"""
-}
+# Lista de variáveis que queremos injetar
+VARS = [
+    "PORT", "CORS_ORIGINS", "CORS_HEADERS", "CORS_METHODS", 
+    "DB_HOST", "DB_PORT", "DB_USER", "DB_PASS", "DB_NAME", 
+    "JWT_SECRET", "OPENAI_API_KEY", 
+    "SCRIPT_BI_SCHEDULER_URL", "SCRIPT_BI_SCHEDULER_RUN_TOKEN"
+]
 
 with open(".env.example", "r") as f:
     lines = f.readlines()
@@ -96,8 +89,10 @@ with open(".env", "w") as f:
     for line in lines:
         if "=" in line and not line.startswith("#"):
             key = line.split("=")[0].strip()
-            if key in secrets and secrets[key]:
-                f.write(f"{key}={secrets[key]}
+            # Buscar no ambiente (injetado pelo appleboy/ssh-action)
+            val = os.environ.get(key)
+            if val:
+                f.write(f"{key}={val}
 ")
             else:
                 f.write(line)
@@ -112,8 +107,8 @@ PYEOF
             python3 generate_env.py
             rm generate_env.py
             
-            echo "✅ Arquivo .env atualizado com Python"
-            echo ""     
+            echo "✅ Arquivo .env atualizado com Python (via ENV)"
+            echo ""      
             echo ""
             
             # Debug: mostrar variáveis injetadas
