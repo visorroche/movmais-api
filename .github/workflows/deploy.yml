@@ -1,58 +1,192 @@
-name: Deploy API
+name: Deploy API (back.movmais.com) - COM DEBUG
 
 on:
   push:
     branches:
       - main
-    paths-ignore:
-      - '**.md'
-      - '**.txt'
+      - master
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Deploy to Server
-        uses: appleboy/ssh-action@v1.0.3
-        with:
+      - name: "📍 Conectar ao servidor"
+        uses: appleboy/ssh-action@master
+                with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.DEPLOY_KEY }}
-          # Não precisamos mais do bloco envs, pois o secret ENV será injetado diretamente no script
+
+          envs: PORT,CORS_ORIGINS,CORS_HEADERS,CORS_METHODS,DB_HOST,DB_PORT,DB_USER,DB_PASS,DB_NAME,JWT_SECRET,OPENAI_API_KEY,SCRIPT_BI_SCHEDULER_URL,SCRIPT_BI_SCHEDULER_RUN_TOKEN
           script: |
             echo "=========================================="
             echo "🚀 INICIANDO DEPLOY DA API"
             echo "=========================================="
+            echo ""
+
+            echo "📍 Data/Hora do deploy"
+            date
+            echo ""
+
+            echo "📍 Verificar diretório"
+            pwd
+            ls -la /opt/movmais/apps/
+            echo ""
+
+            echo "📍 Versão atual no servidor (ANTES do deploy)"
+            cd /opt/movmais/apps/api
+            echo "Commit atual:"
+            git log -1 --oneline
+            echo "Branch:"
+            git branch
+            echo ""
+
+            echo "📍 Atualizar código do GitHub"
+            git fetch origin
+            echo "Commits disponíveis:"
+            git log -3 --oneline
+            echo ""
+
+            echo "📍 Fazer reset hard para origin/main"
+            git reset --hard origin/main
+            echo "✅ Reset concluído"
+            echo ""
+
+            echo "📍 Versão APÓS git reset"
+            git log -1 --oneline
+            echo ""
+
+            echo "📍 Verificar arquivos alterados"
+            git status
+            echo ""
+
+            echo "📍 Verificar conteúdo de arquivo importante (package.json)"
+            head -5 package.json
+            echo ""
+
+                                                                                                                        echo "=========================================="
+            echo "📝 CRIAR ARQUIVO .ENV DINÂMICO"
+            echo "=========================================="
             
             cd /opt/movmais/apps/api
             
-            echo "=========================================="
-            echo "📝 CRIAR ARQUIVO .ENV (SECRET ÚNICO)"
-            echo "=========================================="
+            # Criar script Python para gerar o .env a partir das variáveis de ambiente
+            cat << 'PYEOF' > generate_env.py
+import os
+
+# Lista de variáveis que queremos injetar
+VARS = [
+    "PORT", "CORS_ORIGINS", "CORS_HEADERS", "CORS_METHODS", 
+    "DB_HOST", "DB_PORT", "DB_USER", "DB_PASS", "DB_NAME", 
+    "JWT_SECRET", "OPENAI_API_KEY", 
+    "SCRIPT_BI_SCHEDULER_URL", "SCRIPT_BI_SCHEDULER_RUN_TOKEN"
+]
+
+with open(".env.example", "r") as f:
+    lines = f.readlines()
+
+with open(".env", "w") as f:
+    for line in lines:
+        if "=" in line and not line.startswith("#"):
+            key = line.split("=")[0].strip()
+            # Buscar no ambiente (injetado pelo appleboy/ssh-action)
+            val = os.environ.get(key)
+            if val:
+                f.write(f"{key}={val}
+")
+            else:
+                f.write(line)
+        else:
+            f.write(line)
+    f.write("NODE_ENV=production
+")
+    f.write("DB_SSL=true
+")
+PYEOF
             
-            # 1. Escrever o conteúdo do secret ENV diretamente no arquivo .env
-            # O uso de 'EOF' garante que o conteúdo seja escrito literalmente,
-            # incluindo quebras de linha, sem problemas de escape.
-            cat << 'EOF' > .env
-${{ secrets.ENV }}
-EOF
+            python3 generate_env.py
+            rm generate_env.py
             
+            echo "✅ Arquivo .env atualizado com Python (via ENV)"
+            echo ""         
+            echo ""
+            
+            # Debug: mostrar variáveis injetadas
+            echo "📍 Variáveis no .env:"
+            cat /opt/movmais/apps/api/.env
+            echo ""
+
             echo "=========================================="
-            echo "🔄 ATUALIZAR CÓDIGO E REINICIAR CONTAINER"
+            echo "🐳 DOCKER BUILD"
             echo "=========================================="
-            
-            # 2. Atualizar o código
-            git pull
-            
-            # 3. Parar e remover o container antigo
+            cd /opt/movmais
+            echo ""
+
+            echo "📍 Remover imagem antiga"
+            docker rmi movmais-api -f || echo "Nenhuma imagem anterior"
+            echo ""
+
+            echo "📍 Parar container antigo"
+            docker-compose stop api || echo "Container não estava rodando"
+            echo ""
+
+            echo "📍 Iniciar build (sem cache)"
+            docker-compose build --no-cache api
+            BUILD_STATUS=$?
+
+            if [ $BUILD_STATUS -eq 0 ]; then
+              echo "✅ BUILD SUCESSO"
+            else
+              echo "❌ BUILD FALHOU"
+              exit 1
+            fi
+            echo ""
+
+            echo "=========================================="
+            echo "🚀 INICIAR CONTAINER"
+            echo "=========================================="
             docker-compose down api || true
-            
-            # 4. Reconstruir e subir o container (o build usará o novo .env)
-            docker-compose up -d --build api
-            
+            docker rm movmais-api -f || true
+            docker-compose up -d api
+            echo ""
+
+            echo "📍 Aguardar 5 segundos para container iniciar"
+            sleep 5
+            echo ""
+
+            echo "📍 Status dos containers"
+            docker-compose ps
+            echo ""
+
+            echo "📍 Logs do container (últimas 30 linhas)"
+            docker logs movmais-api | tail -30
+            echo ""
+
             echo "=========================================="
-            echo "✅ DEPLOY CONCLUÍDO"
+            echo "✅ VERIFICAÇÕES FINAIS"
+            echo "=========================================="
+
+            echo "📍 Verificar versão no servidor (APÓS deploy)"
+            cd /opt/movmais/apps/api
+            echo "Commit atual:"
+            git log -1 --oneline
+            echo ""
+
+            echo "📍 Verificar se container está rodando"
+            docker-compose ps api
+            echo ""
+
+            echo "📍 Testar acesso à API"
+            curl -s -I http://127.0.0.1:5003/ | head -3
+            echo ""
+
+            echo "📍 Verificar porta 5003 está aberta"
+            netstat -tlnp | grep 5003 || echo "⚠️ Porta 5003 não encontrada"
+            echo ""
+
+            echo "=========================================="
+            echo "✅ DEPLOY CONCLUÍDO COM SUCESSO!"
+            echo "=========================================="
+            echo "Timestamp: $(date)"
+            echo "URL: https://back.movmais.com"
             echo "=========================================="
