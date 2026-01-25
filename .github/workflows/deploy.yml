@@ -12,13 +12,14 @@ jobs:
     steps:
       - name: "📍 Conectar ao servidor"
         uses: appleboy/ssh-action@master
-                with:
+        with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.DEPLOY_KEY }}
-
-          envs: PORT,CORS_ORIGINS,CORS_HEADERS,CORS_METHODS,DB_HOST,DB_PORT,DB_USER,DB_PASS,DB_NAME,JWT_SECRET,OPENAI_API_KEY,SCRIPT_BI_SCHEDULER_URL,SCRIPT_BI_SCHEDULER_RUN_TOKEN
+          script_stop: true
           script: |
+            set -e
+
             echo "=========================================="
             echo "🚀 INICIANDO DEPLOY DA API"
             echo "=========================================="
@@ -38,7 +39,7 @@ jobs:
             echo "Commit atual:"
             git log -1 --oneline
             echo "Branch:"
-            git branch
+            git branch --show-current || git branch
             echo ""
 
             echo "📍 Atualizar código do GitHub"
@@ -64,56 +65,23 @@ jobs:
             head -5 package.json
             echo ""
 
-                                                                                                                        echo "=========================================="
-            echo "📝 CRIAR ARQUIVO .ENV DINÂMICO"
             echo "=========================================="
-            
+            echo "📝 CRIAR ARQUIVO .ENV (VINDO DO GITHUB SECRET)"
+            echo "=========================================="
+
             cd /opt/movmais/apps/api
-            
-            # Criar script Python para gerar o .env a partir das variáveis de ambiente
-            cat << 'PYEOF' > generate_env.py
-import os
 
-# Lista de variáveis que queremos injetar
-VARS = [
-    "PORT", "CORS_ORIGINS", "CORS_HEADERS", "CORS_METHODS", 
-    "DB_HOST", "DB_PORT", "DB_USER", "DB_PASS", "DB_NAME", 
-    "JWT_SECRET", "OPENAI_API_KEY", 
-    "SCRIPT_BI_SCHEDULER_URL", "SCRIPT_BI_SCHEDULER_RUN_TOKEN"
-]
+            # escreve o conteúdo do secret diretamente no .env (sem base64)
+            cat > .env << 'ENVEOF'
+${{ secrets.ENV_FILE }}
+ENVEOF
 
-with open(".env.example", "r") as f:
-    lines = f.readlines()
-
-with open(".env", "w") as f:
-    for line in lines:
-        if "=" in line and not line.startswith("#"):
-            key = line.split("=")[0].strip()
-            # Buscar no ambiente (injetado pelo appleboy/ssh-action)
-            val = os.environ.get(key)
-            if val:
-                f.write(f"{key}={val}
-")
-            else:
-                f.write(line)
-        else:
-            f.write(line)
-    f.write("NODE_ENV=production
-")
-    f.write("DB_SSL=true
-")
-PYEOF
-            
-            python3 generate_env.py
-            rm generate_env.py
-            
-            echo "✅ Arquivo .env atualizado com Python (via ENV)"
-            echo ""         
+            echo "✅ .env atualizado a partir de secrets.ENV_FILE"
             echo ""
-            
-            # Debug: mostrar variáveis injetadas
-            echo "📍 Variáveis no .env:"
-            cat /opt/movmais/apps/api/.env
+
+            # Não vazar segredos no log:
+            echo "📍 Chaves do .env (sem valores):"
+            awk -F= '/^[A-Za-z_][A-Za-z0-9_]*=/{print $1}' .env | sort
             echo ""
 
             echo "=========================================="
@@ -132,14 +100,6 @@ PYEOF
 
             echo "📍 Iniciar build (sem cache)"
             docker-compose build --no-cache api
-            BUILD_STATUS=$?
-
-            if [ $BUILD_STATUS -eq 0 ]; then
-              echo "✅ BUILD SUCESSO"
-            else
-              echo "❌ BUILD FALHOU"
-              exit 1
-            fi
             echo ""
 
             echo "=========================================="
