@@ -73,10 +73,10 @@ jobs:
 
             # escreve o conteúdo do secret diretamente no .env (sem base64)
             cat > .env << 'ENVEOF'
-${{ secrets.ENV_FILE }}
+${{ secrets.ENV }}
 ENVEOF
 
-            echo "✅ .env atualizado a partir de secrets.ENV_FILE"
+            echo "✅ .env atualizado a partir de secrets.ENV"
             echo ""
 
             # Não vazar segredos no log:
