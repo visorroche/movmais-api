@@ -12,11 +12,14 @@ jobs:
     steps:
       - name: "📍 Conectar ao servidor"
         uses: appleboy/ssh-action@master
+        env:
+          ENV: ${{ secrets.ENV }}
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.DEPLOY_KEY }}
           script_stop: true
+          envs: ENV
           script: |
             set -e
 
@@ -31,21 +34,21 @@ jobs:
 
             echo "📍 Verificar diretório"
             pwd
-            ls -la /opt/movmais/apps/
+            ls -la /opt/movmais/apps/ || true
             echo ""
 
             echo "📍 Versão atual no servidor (ANTES do deploy)"
             cd /opt/movmais/apps/api
             echo "Commit atual:"
-            git log -1 --oneline
+            git log -1 --oneline || true
             echo "Branch:"
-            git branch --show-current || git branch
+            git branch --show-current 2>/dev/null || git branch || true
             echo ""
 
             echo "📍 Atualizar código do GitHub"
             git fetch origin
             echo "Commits disponíveis:"
-            git log -3 --oneline
+            git log -3 --oneline || true
             echo ""
 
             echo "📍 Fazer reset hard para origin/main"
@@ -54,34 +57,34 @@ jobs:
             echo ""
 
             echo "📍 Versão APÓS git reset"
-            git log -1 --oneline
+            git log -1 --oneline || true
             echo ""
 
             echo "📍 Verificar arquivos alterados"
-            git status
+            git status || true
             echo ""
 
             echo "📍 Verificar conteúdo de arquivo importante (package.json)"
-            head -5 package.json
+            head -5 package.json || true
             echo ""
 
             echo "=========================================="
             echo "📝 CRIAR ARQUIVO .ENV (VINDO DO GITHUB SECRET)"
             echo "=========================================="
+            echo ""
 
             cd /opt/movmais/apps/api
 
-            # escreve o conteúdo do secret diretamente no .env (sem base64)
-            cat > .env << 'ENVEOF'
-${{ secrets.ENV }}
-ENVEOF
+            # escreve exatamente o conteúdo do secret ENV, preservando quebras de linha
+            printf '%s' "$ENV" > .env
+            echo "" >> .env
 
             echo "✅ .env atualizado a partir de secrets.ENV"
             echo ""
 
-            # Não vazar segredos no log:
+            # Não vazar segredos no log (mostra só as chaves)
             echo "📍 Chaves do .env (sem valores):"
-            awk -F= '/^[A-Za-z_][A-Za-z0-9_]*=/{print $1}' .env | sort
+            awk -F= '/^[A-Za-z_][A-Za-z0-9_]*=/{print $1}' .env | sort || true
             echo ""
 
             echo "=========================================="
@@ -115,11 +118,11 @@ ENVEOF
             echo ""
 
             echo "📍 Status dos containers"
-            docker-compose ps
+            docker-compose ps || true
             echo ""
 
             echo "📍 Logs do container (últimas 30 linhas)"
-            docker logs movmais-api | tail -30
+            docker logs movmais-api | tail -30 || true
             echo ""
 
             echo "=========================================="
@@ -129,19 +132,19 @@ ENVEOF
             echo "📍 Verificar versão no servidor (APÓS deploy)"
             cd /opt/movmais/apps/api
             echo "Commit atual:"
-            git log -1 --oneline
+            git log -1 --oneline || true
             echo ""
 
             echo "📍 Verificar se container está rodando"
-            docker-compose ps api
+            docker-compose ps api || true
             echo ""
 
             echo "📍 Testar acesso à API"
-            curl -s -I http://127.0.0.1:5003/ | head -3
+            curl -s -I http://127.0.0.1:5003/ | head -3 || true
             echo ""
 
             echo "📍 Verificar porta 5003 está aberta"
-            netstat -tlnp | grep 5003 || echo "⚠️ Porta 5003 não encontrada"
+            netstat -tlnp 2>/dev/null | grep 5003 || echo "⚠️ Porta 5003 não encontrada"
             echo ""
 
             echo "=========================================="
